@@ -1,0 +1,84 @@
+# Binaries
+atlas
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Root-level compiled binaries (from make build)
+/vox
+/speaker-enroll
+/speaker-profile
+/speaker-test
+/stt-record
+
+# Whisper models (large files)
+models/
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Private configuration (contains API keys, personal data)
+config/private/
+*.private.yaml
+*.private.json
+.env
+.env.local
+.env.*.local
+
+# Local data (user's goals, notes, patterns)
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Qdrant data
+qdrant_storage/
+
+# Audio files (voice captures)
+audio/
+recordings/
+*.wav
+*.mp3
+*.ogg
+
+# Logs
+logs/
+*.log
+
+# Build artifacts
+dist/
+build/
+
+# Private docs (personal setup, API keys, etc.)
+docs/private/
+PRIVATE.md
+arch_personal.md
+
+# Dynamic state (contains personal metrics, goals, financial data)
+atlas_state.yaml
+*.state.yaml
+
+# Third-party vendored sources (whisper.cpp, etc.)
+third_party/
+
+# Test data (personal voice recordings)
+test/stt/recordings/
+test/stt/results/
+
+# Claude Code local settings
+.claude/
