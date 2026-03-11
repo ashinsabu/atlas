@@ -52,7 +52,7 @@ func DefaultDetectorConfig() DetectorConfig {
 	return DetectorConfig{
 		SpeechThreshold: 0.5,
 		MinSpeechMs:     250,
-		MinSilenceMs:    300,
+		MinSilenceMs:    1500, // Wait 1.5s of silence before emitting (Siri-like)
 		MaxSpeechMs:     30000,
 		SampleRate:      16000,
 	}

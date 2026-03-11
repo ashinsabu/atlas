@@ -1,0 +1,276 @@
+package debug
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+const maxTranscriptLines = 200
+
+// Model is the bubbletea model for the 4-pane debug TUI.
+type Model struct {
+	// Pane 1 — AUDIO
+	chunkN   int
+	rms, vad float32
+	speaking bool
+	speakStart time.Time
+
+	// Pane 2 — PIPELINE
+	sttState   string // "idle" | "transcribing"
+	queueDepth int
+
+	// Pane 3 — TRANSCRIPT
+	lines        []string
+	scrollOffset int // index of last visible line
+
+	// Pane 4 — TIMINGS
+	lastSTTMs  int64
+	totalSegs  int
+	totalSTTMs int64 // running sum for avg
+
+	width, height int
+
+	cancel context.CancelFunc
+}
+
+func newModel(cancel context.CancelFunc) Model {
+	return Model{
+		sttState: "idle",
+		cancel:   cancel,
+	}
+}
+
+func (m Model) Init() tea.Cmd {
+	return tickCmd()
+}
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(_ time.Time) tea.Msg {
+		return TickMsg{}
+	})
+}
+
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+
+	case TickMsg:
+		// Re-arm the ticker for live duration updates.
+		return m, tickCmd()
+
+	case ChunkMsg:
+		m.chunkN = msg.N
+		m.rms = msg.RMS
+		m.vad = msg.VADProb
+		if msg.Speaking && !m.speaking {
+			m.speakStart = time.Now()
+		}
+		m.speaking = msg.Speaking
+
+	case SegmentStartMsg:
+		m.sttState = "transcribing"
+		m.totalSegs++
+
+	case TranscriptionMsg:
+		m.sttState = "idle"
+		m.lastSTTMs = msg.ElapsedMs
+		m.totalSTTMs += msg.ElapsedMs
+		m = m.addLine(fmt.Sprintf("> %s", msg.Text))
+
+	case TranscriptionEmptyMsg:
+		m.sttState = "idle"
+
+	case TranscriptionErrorMsg:
+		m.sttState = "idle"
+		m = m.addLine(fmt.Sprintf("✗ error: %v", msg.Err))
+
+	case WakeWordMsg:
+		m = m.addLine(fmt.Sprintf("◆ [Command] %s", msg.Command))
+
+	case QueueDepthMsg:
+		m.queueDepth = msg.Depth
+
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "q", "ctrl+c":
+			m.cancel()
+			return m, tea.Quit
+		case "j", "down":
+			if m.scrollOffset < len(m.lines)-1 {
+				m.scrollOffset++
+			}
+		case "k", "up":
+			if m.scrollOffset > 0 {
+				m.scrollOffset--
+			}
+		}
+	}
+	return m, nil
+}
+
+// addLine appends a line and auto-scrolls to the bottom.
+func (m Model) addLine(line string) Model {
+	m.lines = append(m.lines, line)
+	if len(m.lines) > maxTranscriptLines {
+		m.lines = m.lines[len(m.lines)-maxTranscriptLines:]
+	}
+	m.scrollOffset = len(m.lines) - 1
+	return m
+}
+
+func (m Model) View() string {
+	if m.width == 0 {
+		return "Initializing..."
+	}
+
+	// Split width into two equal halves; each pane gets its share minus borders.
+	halfW := m.width / 2
+	leftInner := halfW - 4  // 2 border chars + 2 padding chars per side
+	rightInner := m.width - halfW - 4
+
+	// Height: reserve 1 line for status bar; each pane row is half the rest.
+	usableH := m.height - 1
+	topH := usableH / 2
+	botH := usableH - topH
+	paneInnerH := topH - 2 // minus top+bottom border lines
+
+	audioPane := m.renderAudioPane(leftInner, paneInnerH)
+	pipelinePane := m.renderPipelinePane(rightInner, paneInnerH)
+	transcriptPane := m.renderTranscriptPane(leftInner, botH-2)
+	timingsPane := m.renderTimingsPane(rightInner, botH-2)
+
+	topRow := lipgloss.JoinHorizontal(lipgloss.Top, audioPane, pipelinePane)
+	botRow := lipgloss.JoinHorizontal(lipgloss.Top, transcriptPane, timingsPane)
+	main := lipgloss.JoinVertical(lipgloss.Left, topRow, botRow)
+
+	statusBar := stGray.Render("  ↑↓/jk scroll transcript · q quit")
+	return lipgloss.JoinVertical(lipgloss.Left, main, statusBar)
+}
+
+func (m Model) renderAudioPane(w, h int) string {
+	var sb strings.Builder
+	sb.WriteString(stGray.Render(fmt.Sprintf("#%04d\n", m.chunkN)))
+	sb.WriteString(fmt.Sprintf("MIC  %s %4.2f\n", barStr(m.rms*10.0, 10), m.rms))
+	sb.WriteString(fmt.Sprintf("VAD  %s %4.2f\n", barStr(m.vad, 10), m.vad))
+
+	return paneStyle.Width(w).Height(h).Render(
+		headerStyle.Render("AUDIO") + "\n" + sb.String(),
+	)
+}
+
+func (m Model) renderPipelinePane(w, h int) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Mic    %s\n", stGreen.Render("● active")))
+
+	if m.speaking {
+		dur := time.Since(m.speakStart).Seconds()
+		sb.WriteString(fmt.Sprintf("VAD    %s %.1fs\n", stGreen.Render("◉ speaking"), dur))
+	} else {
+		sb.WriteString(fmt.Sprintf("VAD    %s\n", stGray.Render("· idle")))
+	}
+
+	switch m.sttState {
+	case "transcribing":
+		sb.WriteString(fmt.Sprintf("STT    %s\n", stYellow.Render("⏳ transcribing...")))
+	default:
+		sb.WriteString(fmt.Sprintf("STT    %s\n", stGray.Render("· idle")))
+	}
+
+	sb.WriteString(fmt.Sprintf("Queue  %s\n", stGray.Render(
+		fmt.Sprintf("%d segments pending", m.queueDepth),
+	)))
+
+	return paneStyle.Width(w).Height(h).Render(
+		headerStyle.Render("PIPELINE") + "\n" + sb.String(),
+	)
+}
+
+func (m Model) renderTranscriptPane(w, h int) string {
+	innerH := h
+	if innerH < 1 {
+		innerH = 1
+	}
+
+	// Compute visible slice: scrollOffset is the index of the last visible line.
+	end := m.scrollOffset + 1
+	if end > len(m.lines) {
+		end = len(m.lines)
+	}
+	start := end - innerH
+	if start < 0 {
+		start = 0
+	}
+
+	var rows []string
+	for _, line := range m.lines[start:end] {
+		switch {
+		case strings.HasPrefix(line, "◆"):
+			rows = append(rows, stCyan.Render(line))
+		case strings.HasPrefix(line, "✗"):
+			rows = append(rows, stRed.Render(line))
+		default:
+			rows = append(rows, stGreen.Render(line))
+		}
+	}
+	// Pad to fill pane height so lipgloss border stays stable.
+	for len(rows) < innerH {
+		rows = append(rows, "")
+	}
+
+	return paneStyle.Width(w).Height(h).Render(
+		headerStyle.Render("TRANSCRIPT") + "\n" + strings.Join(rows, "\n"),
+	)
+}
+
+func (m Model) renderTimingsPane(w, h int) string {
+	var avg int64
+	if m.totalSegs > 0 {
+		avg = m.totalSTTMs / int64(m.totalSegs)
+	}
+
+	content := fmt.Sprintf(
+		"Last STT        %dms\nAvg STT         %dms\nSegments total  %d\nQueue depth     %d\n",
+		m.lastSTTMs, avg, m.totalSegs, m.queueDepth,
+	)
+
+	return paneStyle.Width(w).Height(h).Render(
+		headerStyle.Render("TIMINGS") + "\n" + content,
+	)
+}
+
+// barStr renders a fixed-width cyan block bar for a value in [0,1].
+func barStr(v float32, width int) string {
+	if v > 1.0 {
+		v = 1.0
+	}
+	if v < 0 {
+		v = 0
+	}
+	filled := int(v * float32(width))
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+	return stCyan.Render(bar)
+}
+
+// ChunkRMS computes the root mean square of a PCM16 chunk, normalized to [0,1].
+// Exported so pipeline.go can call it without importing "math" itself.
+func ChunkRMS(chunk []byte) float32 {
+	n := len(chunk) / 2
+	if n == 0 {
+		return 0
+	}
+	var sum float64
+	for i := 0; i < n; i++ {
+		s := int16(chunk[i*2]) | int16(chunk[i*2+1])<<8
+		f := float64(s) / 32768.0
+		sum += f * f
+	}
+	return float32(math.Sqrt(sum / float64(n)))
+}

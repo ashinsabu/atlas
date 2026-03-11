@@ -1,8 +1,9 @@
 // Package vox - Pipeline orchestrates the voice processing stages.
 //
 // Pipeline flow:
-//   Mic → AudioSource → SpeechDetector → STT → WakeWordDetector
-//          (chunks)    (speech segments)  (text)    (commands)
+//
+//	Mic → Source → SpeechDetector → STT → WakeWordDetector
+//	       (chunks)    (speech segments)  (text)    (commands)
 //
 // Speaker verification will be added later.
 package vox
@@ -12,8 +13,10 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ashinsabu/atlas/internal/vox/audio"
+	"github.com/ashinsabu/atlas/internal/vox/debug"
 	"github.com/ashinsabu/atlas/internal/vox/speech"
 	"github.com/ashinsabu/atlas/internal/vox/stt"
 	"github.com/ashinsabu/atlas/internal/vox/wakeword"
@@ -21,17 +24,31 @@ import (
 
 // Pipeline orchestrates the voice processing stages.
 type Pipeline struct {
-	audio    audio.AudioSource
+	audio    audio.Source
 	speech   speech.SpeechDetector
 	stt      stt.STT
 	wakeword *wakeword.Detector
 
-	// Callbacks
-	OnCommand func(cmd string)    // Wake word + command detected
-	OnText    func(text string)   // Transcription result
-	OnError   func(err error)     // Processing error
+	// segCh: audio callback → relay goroutine. Small buffer; relay drains it instantly.
+	segCh chan speech.SpeechSegment
+	// sttCh: relay goroutine → STT goroutine. Relay holds a dynamic queue so
+	// the audio callback never blocks and no segments are ever dropped.
+	sttCh chan speech.SpeechSegment
 
-	Debug bool
+	// Callbacks
+	OnCommand func(cmd string)  // Wake word + command detected
+	OnText    func(text string) // Transcription result
+	OnError   func(err error)   // Processing error
+
+	debugger debug.Debugger
+
+	// VAD state written by OnFrame (inside speech.Process), read by processChunk.
+	// Both accesses happen on the single audio-callback goroutine — no mutex needed.
+	vadProb     float32
+	vadSpeaking bool
+
+	// chunkN counts processed chunks; used only by the debugger.
+	chunkN int
 
 	mu     sync.RWMutex
 	status string
@@ -52,8 +69,8 @@ type PipelineConfig struct {
 	// Whisper config
 	Language string
 
-	// Debug mode
-	Debug bool
+	// Debugger receives pipeline events. Use debug.NopDebugger{} when not debugging.
+	Debugger debug.Debugger
 }
 
 // DefaultPipelineConfig returns sensible defaults.
@@ -64,7 +81,7 @@ func DefaultPipelineConfig() PipelineConfig {
 		SpeechConfig:     speech.DefaultDetectorConfig(),
 		AudioConfig:      audio.DefaultSourceConfig(),
 		Language:         "en",
-		Debug:            false,
+		Debugger:         debug.NopDebugger{},
 	}
 }
 
@@ -98,46 +115,118 @@ func NewPipeline(cfg PipelineConfig) (*Pipeline, error) {
 	// Create wake word detector
 	wakewordDetector := wakeword.New()
 
-	return &Pipeline{
+	dbg := cfg.Debugger
+	if dbg == nil {
+		dbg = debug.NopDebugger{}
+	}
+
+	p := &Pipeline{
 		audio:    audioSource,
 		speech:   speechDetector,
 		stt:      sttEngine,
 		wakeword: wakewordDetector,
-		Debug:    cfg.Debug,
+		segCh:    make(chan speech.SpeechSegment, 4),
+		sttCh:    make(chan speech.SpeechSegment, 1),
+		debugger: dbg,
 		status:   "initialized",
-	}, nil
+	}
+
+	// OnFrame is called inside speech.Process every 32ms.
+	// Store VAD state for processChunk to include in the chunk event.
+	speechDetector.OnFrame = func(prob float32, speaking bool) {
+		p.vadProb = prob
+		p.vadSpeaking = speaking
+	}
+
+	return p, nil
 }
 
 // Run starts the pipeline. Blocks until context is cancelled.
 func (p *Pipeline) Run(ctx context.Context) error {
 	p.setStatus("running")
 
+	// relayLoop bridges the fast audio callback to the slow STT goroutine.
+	// It holds an in-memory queue so no segments are ever dropped.
+	go p.relayLoop(ctx)
+	// sttLoop processes segments one at a time from the relay.
+	go p.sttLoop(ctx)
+
 	return p.audio.Start(ctx, func(chunk []byte) {
 		p.processChunk(chunk)
 	})
 }
 
+// relayLoop maintains an unbounded in-memory queue between the audio callback
+// (which sends to segCh) and the STT goroutine (which reads from sttCh).
+// This is the standard Go pattern for an unbounded channel.
+func (p *Pipeline) relayLoop(ctx context.Context) {
+	var queue []speech.SpeechSegment
+	for {
+		if len(queue) == 0 {
+			// Nothing queued — just wait for the next segment.
+			select {
+			case <-ctx.Done():
+				return
+			case seg := <-p.segCh:
+				queue = append(queue, seg)
+				p.debugger.OnQueueDepth(len(queue))
+			}
+		} else {
+			// Have segments queued — race between accepting more and forwarding to STT.
+			select {
+			case <-ctx.Done():
+				return
+			case seg := <-p.segCh:
+				queue = append(queue, seg)
+				p.debugger.OnQueueDepth(len(queue))
+			case p.sttCh <- queue[0]:
+				queue = queue[1:]
+				p.debugger.OnQueueDepth(len(queue))
+			}
+		}
+	}
+}
+
+// sttLoop transcribes segments sequentially as the relay delivers them.
+func (p *Pipeline) sttLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case seg := <-p.sttCh:
+			p.processSegment(&seg)
+		}
+	}
+}
+
 // processChunk handles a single audio chunk through the pipeline.
 func (p *Pipeline) processChunk(chunk []byte) {
+	rms := debug.ChunkRMS(chunk)
+
+	// speech.Process triggers OnFrame which updates p.vadProb / p.vadSpeaking.
 	segments := p.speech.Process(chunk)
 
+	p.chunkN++
+	p.debugger.OnChunk(p.chunkN, rms, p.vadProb, p.vadSpeaking)
+
 	for _, seg := range segments {
-		p.processSegment(&seg)
+		p.segCh <- seg
 	}
 }
 
 // processSegment handles a complete speech segment.
 func (p *Pipeline) processSegment(seg *speech.SpeechSegment) {
-	if p.Debug {
-		fmt.Printf("[pipeline] speech: %.2fs\n", seg.Seconds())
-	}
+	p.debugger.OnSegmentStart(seg.Seconds())
 
 	// Transcribe
 	p.setStatus("transcribing")
+	t0 := time.Now()
 	text, err := p.stt.Transcribe(seg.Audio)
+	elapsed := time.Since(t0)
 	p.setStatus("running")
 
 	if err != nil {
+		p.debugger.OnTranscriptionError(err)
 		if p.OnError != nil {
 			p.OnError(fmt.Errorf("transcribe: %w", err))
 		}
@@ -146,8 +235,11 @@ func (p *Pipeline) processSegment(seg *speech.SpeechSegment) {
 
 	text = strings.TrimSpace(text)
 	if text == "" {
+		p.debugger.OnTranscriptionEmpty(elapsed.Milliseconds())
 		return
 	}
+
+	p.debugger.OnTranscription(text, elapsed.Milliseconds())
 
 	// Notify with transcription
 	if p.OnText != nil {
@@ -156,8 +248,11 @@ func (p *Pipeline) processSegment(seg *speech.SpeechSegment) {
 
 	// Check for wake word
 	command := p.wakeword.Process(text, true)
-	if command != "" && p.OnCommand != nil {
-		p.OnCommand(command)
+	if command != "" {
+		p.debugger.OnWakeWord(command)
+		if p.OnCommand != nil {
+			p.OnCommand(command)
+		}
 	}
 }
 

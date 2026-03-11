@@ -14,6 +14,7 @@ package speech
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"runtime"
 	"sync"
@@ -47,17 +48,20 @@ func init() {
 }
 
 const (
-	// SileroWindowSamples is the number of samples per VAD frame.
-	// Silero expects exactly 512 samples (32ms at 16kHz).
+	// SileroWindowSamples is the number of samples per VAD frame (32ms at 16kHz).
 	SileroWindowSamples = 512
+
+	// SileroContextSamples is the context window prepended to each frame (v5 model).
+	SileroContextSamples = 64
 
 	// SileroSampleRate is the required sample rate.
 	SileroSampleRate = 16000
 
 	// SileroHiddenSize is the LSTM hidden state dimension.
-	SileroHiddenSize = 64
+	// Model uses combined state tensor of shape [2, 1, 128].
+	SileroHiddenSize = 128
 
-	// SileroNumLayers is the number of LSTM layers (2 for h/c).
+	// SileroNumLayers is the number of LSTM layers.
 	SileroNumLayers = 2
 )
 
@@ -66,17 +70,26 @@ type SileroDetector struct {
 	session *ort.DynamicAdvancedSession
 	config  DetectorConfig
 
-	// LSTM hidden states (persisted across calls)
-	h []float32
-	c []float32
+	// LSTM state (combined h+c, persisted across calls).
+	// Shape: [SileroNumLayers, 1, SileroHiddenSize] = [2, 1, 128]
+	state []float32
+
+	// context holds the last SileroContextSamples from the previous frame.
+	// The v5 model requires these 64 samples to be prepended to each window.
+	context []float32
 
 	// Buffering state
-	audioBuffer []byte     // Accumulates PCM16 audio
-	speechBuf   []byte     // Accumulates speech audio
-	speaking    bool       // Currently in speech segment
-	speechStart time.Time  // When current speech started
-	silenceMs   int        // Consecutive silence duration in ms
-	streamStart time.Time  // When the stream started
+	audioBuffer []byte    // Accumulates PCM16 audio
+	speechBuf   []byte    // Accumulates speech audio
+	speaking    bool      // Currently in speech segment
+	speechStart time.Time // When current speech started
+	silenceMs   int       // Consecutive silence duration in ms
+	streamStart time.Time // When the stream started
+
+	// OnFrame is called after each VAD inference (every 32ms).
+	// prob is speech probability [0,1], speaking is the updated state.
+	// Used for debug visualization; nil in normal operation.
+	OnFrame func(prob float32, speaking bool)
 
 	mu sync.Mutex
 }
@@ -103,31 +116,26 @@ func NewSileroDetector(modelPath string, cfg DetectorConfig) (*SileroDetector, e
 	}
 	defer opts.Destroy()
 
-	// Create dynamic session for Silero VAD
-	// Input names: input, sr, h, c
-	// Output names: output, hn, cn
+	// Create dynamic session for Silero VAD.
+	// Input names: input, state, sr
+	// Output names: output, stateN
 	session, err := ort.NewDynamicAdvancedSession(
 		modelPath,
-		[]string{"input", "sr", "h", "c"},
-		[]string{"output", "hn", "cn"},
+		[]string{"input", "state", "sr"},
+		[]string{"output", "stateN"},
 		opts,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create silero session: %w", err)
 	}
 
-	// Initialize hidden states to zeros
-	stateSize := SileroNumLayers * 1 * SileroHiddenSize // [2, 1, 64]
-	h := make([]float32, stateSize)
-	c := make([]float32, stateSize)
-
 	return &SileroDetector{
 		session:     session,
 		config:      cfg,
-		h:           h,
-		c:           c,
-		audioBuffer: make([]byte, 0, SileroWindowSamples*4), // Pre-alloc
-		speechBuf:   make([]byte, 0, cfg.SampleRate*2*30),   // Up to 30s
+		state:       make([]float32, SileroNumLayers*1*SileroHiddenSize),
+		context:     make([]float32, SileroContextSamples),
+		audioBuffer: make([]byte, 0, SileroWindowSamples*4),
+		speechBuf:   make([]byte, 0, cfg.SampleRate*2*30),
 		streamStart: time.Now(),
 	}, nil
 }
@@ -151,7 +159,7 @@ func (d *SileroDetector) Process(chunk []byte) []SpeechSegment {
 		// Run VAD on this window
 		prob, err := d.runVAD(window)
 		if err != nil {
-			// Log error but continue
+			log.Printf("[vad] inference error: %v", err)
 			continue
 		}
 
@@ -169,8 +177,8 @@ func (d *SileroDetector) Process(chunk []byte) []SpeechSegment {
 			d.speechBuf = append(d.speechBuf, window...)
 			d.silenceMs = 0
 
-			// Check max duration
-			speechMs := int(time.Since(d.speechStart).Milliseconds())
+			// Check max duration using buffer length (accurate for both live and offline).
+			speechMs := len(d.speechBuf) * 1000 / (d.config.SampleRate * 2)
 			if speechMs >= d.config.MaxSpeechMs {
 				// Force segment end
 				if seg := d.emitSegment(); seg != nil {
@@ -191,6 +199,10 @@ func (d *SileroDetector) Process(chunk []byte) []SpeechSegment {
 				}
 			}
 			// If not speaking and silence, just discard
+		}
+
+		if d.OnFrame != nil {
+			d.OnFrame(prob, d.speaking)
 		}
 	}
 
@@ -215,15 +227,13 @@ func (d *SileroDetector) Reset() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// Reset hidden states
-	for i := range d.h {
-		d.h[i] = 0
+	for i := range d.state {
+		d.state[i] = 0
 	}
-	for i := range d.c {
-		d.c[i] = 0
+	for i := range d.context {
+		d.context[i] = 0
 	}
 
-	// Reset buffers
 	d.audioBuffer = d.audioBuffer[:0]
 	d.speechBuf = d.speechBuf[:0]
 	d.speaking = false
@@ -248,7 +258,8 @@ func (d *SileroDetector) Close() error {
 // emitSegment creates a segment from current speech buffer.
 // Caller must hold mutex.
 func (d *SileroDetector) emitSegment() *SpeechSegment {
-	speechMs := int(time.Since(d.speechStart).Milliseconds())
+	// Use buffer length for duration — accurate for both live mic and offline WAV processing.
+	speechMs := len(d.speechBuf) * 1000 / (d.config.SampleRate * 2)
 
 	// Check minimum duration
 	if speechMs < d.config.MinSpeechMs {
@@ -287,88 +298,69 @@ func (d *SileroDetector) emitSegment() *SpeechSegment {
 // runVAD runs inference on a single window of audio.
 // window must be exactly 1024 bytes (512 samples of PCM16).
 func (d *SileroDetector) runVAD(window []byte) (float32, error) {
-	// Convert PCM16 to float32
+	// Convert PCM16 window to float32
 	samples := make([]float32, SileroWindowSamples)
 	for i := 0; i < SileroWindowSamples; i++ {
-		sample := int16(window[i*2]) | int16(window[i*2+1])<<8
-		samples[i] = float32(sample) / 32768.0
+		s := int16(window[i*2]) | int16(window[i*2+1])<<8
+		samples[i] = float32(s) / 32768.0
 	}
 
-	// Create input tensors
-	// input: [1, 512]
-	inputShape := ort.NewShape(1, SileroWindowSamples)
-	inputTensor, err := ort.NewTensor(inputShape, samples)
+	// Build input frame: prepend 64-sample context from previous call (v5 model requirement).
+	frame := make([]float32, SileroContextSamples+SileroWindowSamples)
+	copy(frame[:SileroContextSamples], d.context)
+	copy(frame[SileroContextSamples:], samples)
+
+	// input: [1, contextSize+windowSize]
+	inputTensor, err := ort.NewTensor(ort.NewShape(1, SileroContextSamples+SileroWindowSamples), frame)
 	if err != nil {
 		return 0, fmt.Errorf("create input tensor: %w", err)
 	}
 	defer inputTensor.Destroy()
 
-	// sr: scalar int64
-	srShape := ort.NewShape(1)
-	srData := []int64{SileroSampleRate}
-	srTensor, err := ort.NewTensor(srShape, srData)
+	// state: [2, 1, 128]
+	stateTensor, err := ort.NewTensor(ort.NewShape(SileroNumLayers, 1, SileroHiddenSize), d.state)
 	if err != nil {
-		return 0, fmt.Errorf("create sr tensor: %w", err)
+		return 0, fmt.Errorf("create state tensor: %w", err)
 	}
-	defer srTensor.Destroy()
+	defer stateTensor.Destroy()
 
-	// h: [2, 1, 64]
-	hShape := ort.NewShape(SileroNumLayers, 1, SileroHiddenSize)
-	hTensor, err := ort.NewTensor(hShape, d.h)
+	// sr: 0-dim scalar (model requires zero-dimensional, not shape [1])
+	srScalar, err := ort.NewScalar[int64](SileroSampleRate)
 	if err != nil {
-		return 0, fmt.Errorf("create h tensor: %w", err)
+		return 0, fmt.Errorf("create sr scalar: %w", err)
 	}
-	defer hTensor.Destroy()
+	defer srScalar.Destroy()
 
-	// c: [2, 1, 64]
-	cShape := ort.NewShape(SileroNumLayers, 1, SileroHiddenSize)
-	cTensor, err := ort.NewTensor(cShape, d.c)
-	if err != nil {
-		return 0, fmt.Errorf("create c tensor: %w", err)
-	}
-	defer cTensor.Destroy()
-
-	// Create output tensors
-	// output: [1, 1]
-	outputShape := ort.NewShape(1, 1)
-	outputData := make([]float32, 1)
-	outputTensor, err := ort.NewTensor(outputShape, outputData)
-	if err != nil {
-		return 0, fmt.Errorf("create output tensor: %w", err)
-	}
-	defer outputTensor.Destroy()
-
-	// hn: [2, 1, 64]
-	hnData := make([]float32, SileroNumLayers*1*SileroHiddenSize)
-	hnTensor, err := ort.NewTensor(hShape, hnData)
-	if err != nil {
-		return 0, fmt.Errorf("create hn tensor: %w", err)
-	}
-	defer hnTensor.Destroy()
-
-	// cn: [2, 1, 64]
-	cnData := make([]float32, SileroNumLayers*1*SileroHiddenSize)
-	cnTensor, err := ort.NewTensor(cShape, cnData)
-	if err != nil {
-		return 0, fmt.Errorf("create cn tensor: %w", err)
-	}
-	defer cnTensor.Destroy()
-
-	// Run inference
+	// Let ORT auto-allocate outputs (correct approach for dynamic-shape outputs)
+	outputs := []ort.Value{nil, nil}
 	err = d.session.Run(
-		[]ort.ArbitraryTensor{inputTensor, srTensor, hTensor, cTensor},
-		[]ort.ArbitraryTensor{outputTensor, hnTensor, cnTensor},
+		[]ort.Value{inputTensor, stateTensor, srScalar},
+		outputs,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("silero inference: %w", err)
 	}
+	defer outputs[0].Destroy()
+	defer outputs[1].Destroy()
 
-	// Update hidden states for next call
-	copy(d.h, hnTensor.GetData())
-	copy(d.c, cnTensor.GetData())
+	// Read probability from output[0]
+	outputTensor, ok := outputs[0].(*ort.Tensor[float32])
+	if !ok {
+		return 0, fmt.Errorf("unexpected output type: %T", outputs[0])
+	}
+	prob := outputTensor.GetData()[0]
 
-	// Return speech probability
-	return outputTensor.GetData()[0], nil
+	// Read updated state from output[1] and persist for next call
+	stateNTensor, ok := outputs[1].(*ort.Tensor[float32])
+	if !ok {
+		return 0, fmt.Errorf("unexpected stateN type: %T", outputs[1])
+	}
+	copy(d.state, stateNTensor.GetData())
+
+	// Persist context: save last SileroContextSamples of the input frame
+	copy(d.context, frame[SileroWindowSamples:])
+
+	return prob, nil
 }
 
 // ONNX Runtime initialization (shared with speaker module)

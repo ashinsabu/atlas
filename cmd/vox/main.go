@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -20,6 +21,8 @@ import (
 	"syscall"
 
 	"github.com/ashinsabu/atlas/internal/vox"
+	"github.com/ashinsabu/atlas/internal/vox/audio"
+	"github.com/ashinsabu/atlas/internal/vox/debug"
 	"github.com/ashinsabu/atlas/internal/vox/speech"
 )
 
@@ -35,7 +38,7 @@ func main() {
 	// CLI flags
 	whisperModel := flag.String("whisper", "", "Path to Whisper model")
 	sileroModel := flag.String("silero", "models/silero_vad.onnx", "Path to Silero VAD model")
-	debug := flag.Bool("debug", false, "Enable debug output")
+	debugMode := flag.Bool("debug", false, "Enable debug TUI")
 	flag.Parse()
 
 	// Find Whisper model
@@ -49,16 +52,69 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create pipeline config
+	// Create pipeline config (Debugger filled in below based on mode)
 	cfg := vox.PipelineConfig{
 		WhisperModelPath: modelPath,
 		SileroModelPath:  *sileroModel,
 		SpeechConfig:     speech.DefaultDetectorConfig(),
+		AudioConfig:      audio.DefaultSourceConfig(),
 		Language:         "en",
-		Debug:            *debug,
 	}
 
-	// Setup context with signal handling
+	if *debugMode {
+		runDebug(cfg, modelPath, *sileroModel)
+	} else {
+		runNormal(cfg, modelPath, *sileroModel)
+	}
+}
+
+// runDebug runs the pipeline with the bubbletea TUI.
+func runDebug(cfg vox.PipelineConfig, modelPath, sileroModel string) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Signal handling: SIGINT/SIGTERM cancel context, which shuts down the pipeline,
+	// which causes the goroutine to call prog.Quit().
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cancel()
+	}()
+
+	// Build TUI + debugger before creating the pipeline so the pipeline can use
+	// it from the very first chunk.
+	prog, dbg := debug.New(cancel)
+	cfg.Debugger = dbg
+
+	fmt.Printf("%sLoading models...%s\n", colorGray, colorReset)
+	fmt.Printf("%s  Whisper: %s%s\n", colorGray, filepath.Base(modelPath), colorReset)
+	fmt.Printf("%s  Silero:  %s%s\n", colorGray, filepath.Base(sileroModel), colorReset)
+
+	pipeline, err := vox.NewPipeline(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create pipeline: %v\n", err)
+		os.Exit(1)
+	}
+	defer pipeline.Close()
+
+	// Pipeline runs in a background goroutine; TUI runs in the main goroutine.
+	go func() {
+		if err := pipeline.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			prog.Send(debug.TranscriptionErrorMsg{Err: err})
+		}
+		prog.Quit()
+	}()
+
+	if _, err := prog.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// runNormal runs the pipeline with plain terminal output.
+func runNormal(cfg vox.PipelineConfig, modelPath, sileroModel string) {
+	cfg.Debugger = debug.NopDebugger{}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -70,10 +126,9 @@ func main() {
 		cancel()
 	}()
 
-	// Create pipeline
 	fmt.Printf("%sLoading models...%s\n", colorGray, colorReset)
 	fmt.Printf("%s  Whisper: %s%s\n", colorGray, filepath.Base(modelPath), colorReset)
-	fmt.Printf("%s  Silero:  %s%s\n", colorGray, filepath.Base(*sileroModel), colorReset)
+	fmt.Printf("%s  Silero:  %s%s\n", colorGray, filepath.Base(sileroModel), colorReset)
 
 	pipeline, err := vox.NewPipeline(cfg)
 	if err != nil {
@@ -82,7 +137,6 @@ func main() {
 	}
 	defer pipeline.Close()
 
-	// Set up callbacks
 	pipeline.OnText = func(text string) {
 		fmt.Printf("%s> %s%s\n", colorGreen, text, colorReset)
 	}
@@ -97,7 +151,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	}
 
-	// Print banner
 	fmt.Println()
 	fmt.Printf("%s%sATLAS VOX%s\n", colorBold, colorCyan, colorReset)
 	fmt.Printf("%sSay \"Hey Atlas\" to wake%s\n", colorGray, colorReset)
@@ -106,8 +159,7 @@ func main() {
 	fmt.Printf("%sListening...%s\n", colorGreen, colorReset)
 	fmt.Println()
 
-	// Run
-	if err := pipeline.Run(ctx); err != nil && err != context.Canceled {
+	if err := pipeline.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
