@@ -12,18 +12,20 @@ type Debugger interface {
 	OnTranscriptionError(err error)
 	OnWakeWord(command string)
 	OnQueueDepth(n int)
+	OnSpeakerVerified(name string, score float32, accepted bool)
 }
 
 // NopDebugger is a no-op Debugger used when debug mode is disabled.
 type NopDebugger struct{}
 
-func (NopDebugger) OnChunk(_ int, _, _ float32, _ bool) {}
-func (NopDebugger) OnSegmentStart(_ float64)             {}
-func (NopDebugger) OnTranscription(_ string, _ int64)   {}
-func (NopDebugger) OnTranscriptionEmpty(_ int64)         {}
-func (NopDebugger) OnTranscriptionError(_ error)         {}
-func (NopDebugger) OnWakeWord(_ string)                  {}
-func (NopDebugger) OnQueueDepth(_ int)                   {}
+func (NopDebugger) OnChunk(_ int, _, _ float32, _ bool)           {}
+func (NopDebugger) OnSegmentStart(_ float64)                       {}
+func (NopDebugger) OnTranscription(_ string, _ int64)             {}
+func (NopDebugger) OnTranscriptionEmpty(_ int64)                   {}
+func (NopDebugger) OnTranscriptionError(_ error)                   {}
+func (NopDebugger) OnWakeWord(_ string)                            {}
+func (NopDebugger) OnQueueDepth(_ int)                             {}
+func (NopDebugger) OnSpeakerVerified(_ string, _ float32, _ bool) {}
 
 // UIDebugger forwards pipeline events to a bubbletea program as messages.
 // tea.Program.Send is goroutine-safe — safe to call from the audio callback,
@@ -58,4 +60,8 @@ func (u *UIDebugger) OnWakeWord(command string) {
 
 func (u *UIDebugger) OnQueueDepth(n int) {
 	u.prog.Send(QueueDepthMsg{Depth: n})
+}
+
+func (u *UIDebugger) OnSpeakerVerified(name string, score float32, accepted bool) {
+	u.prog.Send(SpeakerMsg{Name: name, Score: score, Accepted: accepted})
 }

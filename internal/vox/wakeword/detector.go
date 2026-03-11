@@ -42,10 +42,9 @@ type Detector struct {
 	commandBuffer strings.Builder
 }
 
-// New creates a detector with default wake words.
+// New creates a detector. Call WithWakeWords to configure wake phrases before use.
 func New() *Detector {
 	return &Detector{
-		wakeWords:     []string{"hey atlas", "atlas"},
 		state:         Idle,
 		ListenTimeout: 10 * time.Second,
 	}
@@ -73,81 +72,51 @@ func (d *Detector) Process(transcript string, isFinal bool) string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	lower := strings.ToLower(transcript)
-
 	switch d.state {
 	case Idle:
-		// Look for wake word
-		for _, wake := range d.wakeWords {
-			if idx := strings.Index(lower, wake); idx != -1 {
-				// Found wake word - extract command portion
-				commandStart := idx + len(wake)
-				command := strings.TrimSpace(transcript[commandStart:])
-				// Strip leading punctuation (Whisper often adds "," or ":")
-				command = strings.TrimLeft(command, ",.;:!? ")
-
-				d.state = Listening
-				d.listenStart = time.Now()
-				d.commandBuffer.Reset()
-
-				if d.OnWake != nil {
-					d.OnWake()
-				}
-
-				if command != "" {
-					d.commandBuffer.WriteString(command)
-				}
-
-				return command
-			}
+		command, found := findWakeWord(transcript, d.wakeWords)
+		if !found {
+			return ""
 		}
-		return "" // No wake word, nothing to display
+		d.state = Listening
+		d.listenStart = time.Now()
+		d.commandBuffer.Reset()
+		if d.OnWake != nil {
+			d.OnWake()
+		}
+		if command != "" {
+			d.commandBuffer.WriteString(command)
+		}
+		return command
 
 	case Listening:
-		// Check for timeout
 		if time.Since(d.listenStart) > d.ListenTimeout {
 			d.state = Idle
 			d.commandBuffer.Reset()
 			return ""
 		}
 
-		// Check if this transcript contains another wake word (interruption)
-		for _, wake := range d.wakeWords {
-			if idx := strings.Index(lower, wake); idx != -1 {
-				// New wake word - reset and start fresh
-				commandStart := idx + len(wake)
-				command := strings.TrimSpace(transcript[commandStart:])
-				command = strings.TrimLeft(command, ",.;:!? ")
-
-				d.listenStart = time.Now()
-				d.commandBuffer.Reset()
-
-				if d.OnWake != nil {
-					d.OnWake()
-				}
-
-				if command != "" {
-					d.commandBuffer.WriteString(command)
-				}
-
-				return command
+		// Re-trigger on another wake word (interruption).
+		if command, found := findWakeWord(transcript, d.wakeWords); found {
+			d.listenStart = time.Now()
+			d.commandBuffer.Reset()
+			if d.OnWake != nil {
+				d.OnWake()
 			}
-		}
-
-		// No wake word - this is command content
-		if isFinal {
-			// Final result - command is complete
-			command := strings.TrimSpace(transcript)
-			d.state = Idle
-
-			if d.OnCommand != nil && command != "" {
-				d.OnCommand(command)
+			if command != "" {
+				d.commandBuffer.WriteString(command)
 			}
-
 			return command
 		}
 
-		// Interim result - show progress
+		if isFinal {
+			command := strings.TrimSpace(transcript)
+			d.state = Idle
+			if d.OnCommand != nil && command != "" {
+				d.OnCommand(command)
+			}
+			return command
+		}
 		return transcript
 	}
 
@@ -167,4 +136,80 @@ func (d *Detector) IsListening() bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.state == Listening
+}
+
+// findWakeWord searches text for any wake phrase and returns the command portion.
+//
+// Two-pass strategy:
+//  1. Exact substring match (fast path, handles the common case).
+//  2. Word-level fuzzy match: each word in the transcript is compared against
+//     the corresponding phrase word; edit distance ≤ 1 is accepted. This catches
+//     common Whisper transcription errors like "Atlast" or "Atlass" for "Atlas".
+func findWakeWord(text string, phrases []string) (command string, found bool) {
+	lower := strings.ToLower(text)
+
+	// Pass 1: exact substring match.
+	for _, phrase := range phrases {
+		if idx := strings.Index(lower, phrase); idx != -1 {
+			after := strings.TrimSpace(text[idx+len(phrase):])
+			return strings.TrimLeft(after, ",.;:!? "), true
+		}
+	}
+
+	// Pass 2: word-level fuzzy match.
+	lowerWords := strings.Fields(lower)
+	origWords := strings.Fields(text)
+
+	for _, phrase := range phrases {
+		parts := strings.Fields(phrase)
+		if len(parts) == 0 || len(lowerWords) < len(parts) {
+			continue
+		}
+		for i := 0; i <= len(lowerWords)-len(parts); i++ {
+			match := true
+			for j, pw := range parts {
+				tw := strings.TrimRight(lowerWords[i+j], ",.!?;:")
+				if tw != pw && levenshtein(tw, pw) > 1 {
+					match = false
+					break
+				}
+			}
+			if match {
+				after := strings.Join(origWords[i+len(parts):], " ")
+				return strings.TrimLeft(after, ",.;:!? "), true
+			}
+		}
+	}
+
+	return "", false
+}
+
+// levenshtein computes the edit distance between two strings.
+// Uses the standard two-row DP algorithm; O(len(a)*len(b)) time, O(len(b)) space.
+func levenshtein(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	la, lb := len(ra), len(rb)
+	if la == 0 {
+		return lb
+	}
+	if lb == 0 {
+		return la
+	}
+	prev := make([]int, lb+1)
+	curr := make([]int, lb+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 0; i < la; i++ {
+		curr[0] = i + 1
+		for j := 0; j < lb; j++ {
+			cost := 1
+			if ra[i] == rb[j] {
+				cost = 0
+			}
+			curr[j+1] = min(curr[j]+1, min(prev[j+1]+1, prev[j]+cost))
+		}
+		prev, curr = curr, prev
+	}
+	return prev[lb]
 }

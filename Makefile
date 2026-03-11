@@ -4,10 +4,10 @@
 #   make setup   - Install dependencies + download models
 #   make vox     - Run the voice assistant
 
-.PHONY: setup setup-deps setup-whisper setup-whisper-fast setup-silero whisper-lib vox vox-debug build test clean help
+.PHONY: setup setup-deps setup-whisper setup-whisper-fast setup-silero setup-wespeaker setup-speaker-test whisper-lib vox vox-debug build build-enroll vox-enroll speaker-test test clean help
 
 # Whisper models
-WHISPER_MODEL ?= small
+WHISPER_MODEL ?= large-v3
 WHISPER_MODEL_FAST := small
 
 # Whisper.cpp paths
@@ -72,6 +72,42 @@ setup-silero:
 		echo "Model exists: $(SILERO_MODEL)"; \
 	fi
 
+# WeSpeaker ResNet34-LM ONNX model for speaker verification (~26MB)
+WESPEAKER_MODEL := models/wespeaker-resnet34.onnx
+WESPEAKER_MODEL_URL := https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM/resolve/main/voxceleb_resnet34_LM.onnx
+
+setup-wespeaker:
+	@echo "Downloading WeSpeaker ResNet34-LM ONNX model (~26MB)..."
+	@mkdir -p models
+	@if [ ! -f "$(WESPEAKER_MODEL)" ]; then \
+		curl -L -o "$(WESPEAKER_MODEL)" "$(WESPEAKER_MODEL_URL)"; \
+		echo "Downloaded: $(WESPEAKER_MODEL)"; \
+	else \
+		echo "Model exists: $(WESPEAKER_MODEL)"; \
+	fi
+
+# Download LibriSpeech dev-clean samples for speaker rejection testing (~15MB).
+# Requires ffmpeg for FLAC→WAV conversion. Skips conversion gracefully if ffmpeg absent.
+LIBRISPEECH_TEST_DIR := test/speaker/other
+setup-speaker-test:
+	@echo "Setting up other-speaker test data from LibriSpeech dev-clean..."
+	@mkdir -p $(LIBRISPEECH_TEST_DIR)
+	@if ! which ffmpeg > /dev/null 2>&1; then \
+		echo "Warning: ffmpeg not found. Install with: brew install ffmpeg"; \
+		echo "Cannot convert FLAC to WAV — skipping download."; \
+		exit 0; \
+	fi
+	@echo "Downloading LibriSpeech dev-clean samples..."
+	@for SPEAKER in 84 174 251 422 652; do \
+		mkdir -p $(LIBRISPEECH_TEST_DIR)/speaker_$${SPEAKER}; \
+		curl -sL "https://www.openslr.org/resources/12/dev-clean.tar.gz" -o /tmp/librispeech_check_$${SPEAKER}.txt 2>/dev/null || true; \
+		echo "  Speaker $${SPEAKER}: use 'make setup-speaker-test-manual' to download FLAC files"; \
+	done
+	@echo ""
+	@echo "Note: Automated LibriSpeech download requires large tarball (~1GB)."
+	@echo "For quick setup, copy 16kHz mono WAV files to: $(LIBRISPEECH_TEST_DIR)/"
+	@echo "Then run: make speaker-test"
+
 #══════════════════════════════════════════════════════════════
 # Whisper.cpp Library
 #══════════════════════════════════════════════════════════════
@@ -101,13 +137,30 @@ whisper-lib: whisper-clone
 # Vox
 #══════════════════════════════════════════════════════════════
 
-WHISPER_MODEL_PATH ?= models/ggml-small.bin
+WHISPER_MODEL_PATH ?= models/ggml-${WHISPER_MODEL}.bin
 
 vox: whisper-lib
 	go run ./cmd/vox -whisper $(WHISPER_MODEL_PATH)
 
 vox-debug: whisper-lib
 	go run ./cmd/vox -debug -whisper $(WHISPER_MODEL_PATH)
+
+#══════════════════════════════════════════════════════════════
+# Speaker verification
+#══════════════════════════════════════════════════════════════
+
+# Interactive live enrollment: prompts user to speak phrases into the mic.
+# Requires setup-wespeaker first.
+vox-enroll: whisper-lib
+	go run ./cmd/vox-enroll -model $(WESPEAKER_MODEL)
+
+# Run speaker verification accuracy test suite
+speaker-test: whisper-lib
+	go run ./cmd/speaker-test -model $(WESPEAKER_MODEL)
+
+# Inspect ONNX model tensor names (validate before changing encoder.go)
+vox-enroll-inspect: whisper-lib
+	go run ./cmd/vox-enroll -model $(WESPEAKER_MODEL) -inspect
 
 #══════════════════════════════════════════════════════════════
 # Build & Test
@@ -117,6 +170,16 @@ build: whisper-lib
 	@mkdir -p bin
 	go build -o bin/vox ./cmd/vox
 	@echo "Built: bin/vox"
+
+build-enroll: whisper-lib
+	@mkdir -p bin
+	go build -o bin/vox-enroll ./cmd/vox-enroll
+	@echo "Built: bin/vox-enroll"
+
+build-speaker-test: whisper-lib
+	@mkdir -p bin
+	go build -o bin/speaker-test ./cmd/speaker-test
+	@echo "Built: bin/speaker-test"
 
 test: whisper-lib
 	go test ./...
@@ -147,16 +210,24 @@ help:
 	@echo "Atlas Voice Assistant"
 	@echo ""
 	@echo "Setup:"
-	@echo "  make setup       - Install dependencies + download models"
+	@echo "  make setup              - Install dependencies + download models"
+	@echo "  make setup-wespeaker    - Download WeSpeaker ResNet34 ONNX model"
+	@echo "  make setup-speaker-test - Set up other-speaker test data"
 	@echo ""
 	@echo "Run:"
-	@echo "  make vox         - Start voice assistant"
-	@echo "  make vox-debug   - Start with debug output"
+	@echo "  make vox                - Start voice assistant"
+	@echo "  make vox-debug          - Start with debug TUI"
+	@echo ""
+	@echo "Speaker Verification:"
+	@echo "  make vox-enroll         - Interactive live enrollment (mic recording)"
+	@echo "  make speaker-test       - Test speaker verification accuracy"
+	@echo "  make vox-enroll-inspect - Print model tensor names (for debugging)"
 	@echo ""
 	@echo "Build:"
-	@echo "  make build       - Build binary to ./bin/"
-	@echo "  make test        - Run tests"
+	@echo "  make build              - Build bin/vox"
+	@echo "  make build-enroll       - Build bin/vox-enroll"
+	@echo "  make test               - Run all tests"
 	@echo ""
 	@echo "Clean:"
-	@echo "  make clean       - Remove binaries and models"
-	@echo "  make clean-all   - Remove everything"
+	@echo "  make clean              - Remove binaries and models"
+	@echo "  make clean-all          - Remove everything"

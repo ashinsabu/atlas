@@ -17,8 +17,9 @@ Transport: Interface-based. Local = channels. Remote = gRPC. Vox on Pi, Brain on
 - Go 1.24+, SQLite, Qdrant, Claude API, gRPC
 - Whisper.cpp via CGO (local STT)
 - Silero VAD via ONNX (speech detection)
+- WeSpeaker ResNet34-LM via ONNX (speaker verification)
 - PortAudio (audio capture)
-- ONNX Runtime (VAD, future speaker verification)
+- ONNX Runtime (VAD + speaker verification)
 
 ## Key Constraints
 
@@ -40,19 +41,23 @@ Say **"Hey Atlas, what should I do now?"** to interact.
 ## Vox Pipeline
 
 ```
-Mic → AudioSource → SpeechDetector → STT → WakeWordDetector
-       (32ms chunks)   (Silero VAD)    (Whisper)   (text match)
+Mic → AudioSource → SpeechDetector → STT → WakeWordDetector → SpeakerVerifier
+       (32ms chunks)   (Silero VAD)    (Whisper)   (text match)    (wake only)
 ```
+
+Speaker verification runs **only when the wake word fires**. Non-wake speech goes to `OnText` unverified. This matches Siri's approach: authenticate at the wake phrase, trust the command that follows.
 
 ## Directory Structure
 
 ```
-cmd/vox/              # Entry point
+cmd/vox/              # Entry point (normal + debug modes)
+cmd/vox-enroll/       # Speaker enrollment CLI (live mic recording)
+cmd/speaker-test/     # Speaker verification accuracy test harness
 internal/vox/
   audio/
     source.go         # AudioSource interface
-    portaudio.go      # PortAudio implementation
-    wav.go            # WAV load/save utilities (currently unused, kept for future use)
+    portaudio.go      # PortAudio implementation (Debug flag gates device info)
+    wav.go            # WAV load/save utilities (used by speaker enrollment)
   speech/
     detector.go       # SpeechDetector interface + DetectorConfig
     segment.go        # SpeechSegment type
@@ -61,9 +66,27 @@ internal/vox/
     whisper.go        # Whisper.cpp via CGO
   wakeword/
     detector.go       # Wake word detection
-  pipeline.go         # Main orchestrator — vox-debug visualization lives here
-models/               # gitignored - whisper + silero models
-third_party/          # gitignored - whisper.cpp source
+  speaker/
+    fbank.go          # Mel-filterbank feature extraction (pure Go, Kaldi-compatible)
+    encoder.go        # WeSpeaker ONNX encoder: PCM → fbank → embedding
+    verifier.go       # Enrollment + real-time speaker verification
+    profile.go        # JSON speaker profile (load/save)
+    inspect.go        # ONNX tensor name inspection utility
+  config/
+    config.go         # YAML config (atlas.vox namespace); ConfigDir() for profile paths
+  debug/
+    debugger.go       # Debugger interface + NopDebugger + UIDebugger
+    events.go         # Tea messages: ChunkMsg, SegmentMsg, STTMsg, SpeakerMsg
+    ui.go             # Bubbletea TUI (4 panes: AUDIO, PIPELINE, TRANSCRIPT, STATS)
+    styles.go         # Lipgloss styles
+    debug.go          # debug.New() entry point (returns prog, dbg, *monitor.Tracker)
+  pipeline.go         # Main orchestrator; verifier field; OnSpeakerVerified callback
+internal/monitor/
+  tracker.go          # Concurrent-safe per-stage latency recorder; Go runtime snapshot
+models/               # gitignored — whisper, silero, wespeaker models
+third_party/          # gitignored — whisper.cpp source
+docs/
+  engineering-concepts.md  # Low-level systems reference for this codebase
 ```
 
 ## Build System
@@ -76,27 +99,48 @@ third_party/          # gitignored - whisper.cpp source
 |----------|-----|
 | Whisper via CGO | Single binary, no subprocess, direct memory |
 | Silero VAD | Neural speech detection, not energy-based |
+| WeSpeaker ResNet34-LM | Speaker embeddings via ONNX; Pi-deployable, no GPU |
+| Fbank in pure Go | No Python dependency; matches WeSpeaker training exactly |
 | ONNX Runtime | Runs on Pi, no GPU required |
 | Interface-based pipeline | Clean, testable, swappable implementations |
+| Config via YAML + CLI flags | YAML becomes flag defaults; CLI overrides automatically |
 
 ## Current Status
 
-Vox pipeline working end-to-end: PortAudio → Silero VAD → Whisper STT → wake word detection.
+**Beta.** Full pipeline working end-to-end with speaker verification.
 
 Debug mode (`make vox-debug`) shows real-time per-chunk pipeline meter:
 ```
   #0042  MIC ████░░░░░░ 0.24 | VAD ██████████ 0.89  ◉ 1.2s
 ```
-Then on segment detection:
+On segment detection:
 ```
   ▸ seg  1.4s  →  transcribing...
   ✓ "Hey Atlas, what time is it?"  (287ms)
+  SPK  [Ashin] 0.81 ✓
   ◆ wake: what time is it?
 ```
 
+Speaker verification stats (Ashin, 25 recordings):
+- TPR: 100% at threshold 0.70
+- Score range: 0.719 – 0.855
+- Enable in `vox.yaml`: `atlas.vox.speaker.enabled: true`
+
+Config priority: `$ATLAS_CONFIG_DIR/vox.yaml` → `./vox.yaml` → hardcoded defaults.
+
+## Speaker Verification Setup
+
+```bash
+make setup-wespeaker   # Download WeSpeaker ResNet34-LM ONNX (~25MB)
+make vox-enroll        # Interactive mic enrollment (5 phrases × 2 takes)
+make speaker-test      # Accuracy report (TPR + TNR)
+```
+
+Profile saved to `./speaker.json` (or `$ATLAS_CONFIG_DIR/speaker.json`).
+
 ## Next Priorities
 
-1. Speaker verification (build from scratch using ONNX-compatible model)
-2. gRPC transport (Vox ↔ Brain)
-3. TTS for responses
-4. Brain module (intent parsing, LLM)
+1. gRPC transport (Vox ↔ Brain)
+2. TTS for responses
+3. Brain module (intent parsing, LLM)
+4. Pi deployment validation

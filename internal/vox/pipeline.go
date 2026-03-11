@@ -2,10 +2,10 @@
 //
 // Pipeline flow:
 //
-//	Mic → Source → SpeechDetector → STT → WakeWordDetector
-//	       (chunks)    (speech segments)  (text)    (commands)
+//	Mic → Source → SpeechDetector → STT → WakeWordDetector → SpeakerVerifier
+//	       (chunks)    (speech segments)  (text)    (commands)      (wake only)
 //
-// Speaker verification will be added later.
+// Speaker verification runs only when the wake word fires, not on every segment.
 package vox
 
 import (
@@ -15,8 +15,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ashinsabu/atlas/internal/monitor"
 	"github.com/ashinsabu/atlas/internal/vox/audio"
 	"github.com/ashinsabu/atlas/internal/vox/debug"
+	"github.com/ashinsabu/atlas/internal/vox/speaker"
 	"github.com/ashinsabu/atlas/internal/vox/speech"
 	"github.com/ashinsabu/atlas/internal/vox/stt"
 	"github.com/ashinsabu/atlas/internal/vox/wakeword"
@@ -28,6 +30,7 @@ type Pipeline struct {
 	speech   speech.SpeechDetector
 	stt      stt.STT
 	wakeword *wakeword.Detector
+	verifier *speaker.Verifier // nil = speaker verification disabled (pass-all)
 
 	// segCh: audio callback → relay goroutine. Small buffer; relay drains it instantly.
 	segCh chan speech.SpeechSegment
@@ -36,16 +39,22 @@ type Pipeline struct {
 	sttCh chan speech.SpeechSegment
 
 	// Callbacks
-	OnCommand func(cmd string)  // Wake word + command detected
-	OnText    func(text string) // Transcription result
-	OnError   func(err error)   // Processing error
+	OnCommand          func(cmd string)                         // Wake word + command detected
+	OnText             func(text string)                        // Transcription result
+	OnError            func(err error)                          // Processing error
+	OnSpeakerVerified  func(name string, score float32, accepted bool) // Speaker verification result
 
 	debugger debug.Debugger
+	mon      *monitor.Tracker // nil = monitoring disabled (no-ops)
 
 	// VAD state written by OnFrame (inside speech.Process), read by processChunk.
 	// Both accesses happen on the single audio-callback goroutine — no mutex needed.
 	vadProb     float32
 	vadSpeaking bool
+
+	// wakeJustFired is set by wakeword.OnWake and read in processSegment.
+	// Both happen on the sttLoop goroutine — no mutex needed.
+	wakeJustFired bool
 
 	// chunkN counts processed chunks; used only by the debugger.
 	chunkN int
@@ -67,10 +76,20 @@ type PipelineConfig struct {
 	AudioConfig audio.SourceConfig
 
 	// Whisper config
-	Language string
+	Language      string
+	WhisperPrompt string
+
+	// Speaker is an optional speaker verifier. nil = verification disabled (all speakers pass).
+	Speaker *speaker.Verifier
 
 	// Debugger receives pipeline events. Use debug.NopDebugger{} when not debugging.
 	Debugger debug.Debugger
+
+	// Monitor records per-stage latencies. nil = monitoring disabled.
+	Monitor *monitor.Tracker
+
+	// WakeWords sets the wake phrases. If empty, the detector uses no default wake words.
+	WakeWords []string
 }
 
 // DefaultPipelineConfig returns sensible defaults.
@@ -102,8 +121,9 @@ func NewPipeline(cfg PipelineConfig) (*Pipeline, error) {
 
 	// Create STT engine
 	whisperCfg := stt.WhisperConfig{
-		ModelPath: cfg.WhisperModelPath,
-		Language:  cfg.Language,
+		ModelPath:     cfg.WhisperModelPath,
+		Language:      cfg.Language,
+		InitialPrompt: cfg.WhisperPrompt,
 	}
 	sttEngine, err := stt.NewWhisper(whisperCfg)
 	if err != nil {
@@ -114,6 +134,9 @@ func NewPipeline(cfg PipelineConfig) (*Pipeline, error) {
 
 	// Create wake word detector
 	wakewordDetector := wakeword.New()
+	if len(cfg.WakeWords) > 0 {
+		wakewordDetector.WithWakeWords(cfg.WakeWords...)
+	}
 
 	dbg := cfg.Debugger
 	if dbg == nil {
@@ -125,9 +148,11 @@ func NewPipeline(cfg PipelineConfig) (*Pipeline, error) {
 		speech:   speechDetector,
 		stt:      sttEngine,
 		wakeword: wakewordDetector,
+		verifier: cfg.Speaker,
 		segCh:    make(chan speech.SpeechSegment, 4),
 		sttCh:    make(chan speech.SpeechSegment, 1),
 		debugger: dbg,
+		mon:      cfg.Monitor,
 		status:   "initialized",
 	}
 
@@ -137,6 +162,10 @@ func NewPipeline(cfg PipelineConfig) (*Pipeline, error) {
 		p.vadProb = prob
 		p.vadSpeaking = speaking
 	}
+
+	// OnWake fires on the sttLoop goroutine when the wake phrase is first detected.
+	// Set wakeJustFired so processSegment can trigger speaker verification.
+	wakewordDetector.OnWake = func() { p.wakeJustFired = true }
 
 	return p, nil
 }
@@ -204,7 +233,11 @@ func (p *Pipeline) processChunk(chunk []byte) {
 	rms := debug.ChunkRMS(chunk)
 
 	// speech.Process triggers OnFrame which updates p.vadProb / p.vadSpeaking.
+	t0vad := time.Now()
 	segments := p.speech.Process(chunk)
+	if p.mon != nil {
+		p.mon.Record("vad", time.Since(t0vad))
+	}
 
 	p.chunkN++
 	p.debugger.OnChunk(p.chunkN, rms, p.vadProb, p.vadSpeaking)
@@ -218,11 +251,14 @@ func (p *Pipeline) processChunk(chunk []byte) {
 func (p *Pipeline) processSegment(seg *speech.SpeechSegment) {
 	p.debugger.OnSegmentStart(seg.Seconds())
 
-	// Transcribe
+	// Transcribe.
 	p.setStatus("transcribing")
 	t0 := time.Now()
 	text, err := p.stt.Transcribe(seg.Audio)
 	elapsed := time.Since(t0)
+	if p.mon != nil {
+		p.mon.Record("stt", elapsed)
+	}
 	p.setStatus("running")
 
 	if err != nil {
@@ -241,17 +277,43 @@ func (p *Pipeline) processSegment(seg *speech.SpeechSegment) {
 
 	p.debugger.OnTranscription(text, elapsed.Milliseconds())
 
-	// Notify with transcription
-	if p.OnText != nil {
-		p.OnText(text)
-	}
-
-	// Check for wake word
+	// Check for wake word. OnWake sets p.wakeJustFired when the wake phrase is
+	// detected for the first time in this segment (not on follow-up Listening segments).
+	p.wakeJustFired = false
 	command := p.wakeword.Process(text, true)
+
 	if command != "" {
+		// Wake word fired — verify the speaker before acting.
+		// Verification runs here (after STT) so we only pay the cost on wake events.
+		// TODO: verify Listening follow-ups too if multi-user support is needed.
+		if p.wakeJustFired && p.verifier != nil {
+			t0spk := time.Now()
+			name, score, accepted, verErr := p.verifier.Verify(seg.Audio)
+			if p.mon != nil {
+				p.mon.Record("spk", time.Since(t0spk))
+			}
+			p.debugger.OnSpeakerVerified(name, score, accepted)
+			if p.OnSpeakerVerified != nil {
+				p.OnSpeakerVerified(name, score, accepted)
+			}
+			if verErr != nil && p.OnError != nil {
+				p.OnError(fmt.Errorf("speaker verify: %w", verErr))
+			}
+			if !accepted {
+				return // Unknown speaker — discard command
+			}
+		}
+		if p.OnText != nil {
+			p.OnText(text)
+		}
 		p.debugger.OnWakeWord(command)
 		if p.OnCommand != nil {
 			p.OnCommand(command)
+		}
+	} else {
+		// No wake word — deliver transcription without verification.
+		if p.OnText != nil {
+			p.OnText(text)
 		}
 	}
 }

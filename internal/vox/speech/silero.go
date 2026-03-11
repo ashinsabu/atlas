@@ -14,38 +14,15 @@ package speech
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
-	"runtime"
 	"sync"
 	"time"
 
 	ort "github.com/yalue/onnxruntime_go"
+
+	ortinit "github.com/ashinsabu/atlas/internal/vox/ort"
 )
-
-func init() {
-	// Set ONNX Runtime shared library path based on platform
-	var libPath string
-	switch runtime.GOOS {
-	case "darwin":
-		paths := []string{
-			"/opt/homebrew/lib/libonnxruntime.dylib", // ARM64 Homebrew
-			"/usr/local/lib/libonnxruntime.dylib",    // Intel Homebrew
-		}
-		for _, p := range paths {
-			if _, err := os.Stat(p); err == nil {
-				libPath = p
-				break
-			}
-		}
-	case "linux":
-		libPath = "/usr/lib/libonnxruntime.so"
-	}
-
-	if libPath != "" {
-		ort.SetSharedLibraryPath(libPath)
-	}
-}
 
 const (
 	// SileroWindowSamples is the number of samples per VAD frame (32ms at 16kHz).
@@ -104,8 +81,8 @@ func NewSileroDetector(modelPath string, cfg DetectorConfig) (*SileroDetector, e
 		return nil, fmt.Errorf("silero model not found: %s (run 'make setup-silero')", modelPath)
 	}
 
-	// Initialize ONNX Runtime
-	if err := initONNXRuntime(); err != nil {
+	// Initialize ONNX Runtime (shared once across all packages)
+	if err := ortinit.Initialize(); err != nil {
 		return nil, fmt.Errorf("init onnx runtime: %w", err)
 	}
 
@@ -159,7 +136,7 @@ func (d *SileroDetector) Process(chunk []byte) []SpeechSegment {
 		// Run VAD on this window
 		prob, err := d.runVAD(window)
 		if err != nil {
-			log.Printf("[vad] inference error: %v", err)
+			slog.Debug("vad inference error", "err", err)
 			continue
 		}
 
@@ -361,17 +338,4 @@ func (d *SileroDetector) runVAD(window []byte) (float32, error) {
 	copy(d.context, frame[SileroWindowSamples:])
 
 	return prob, nil
-}
-
-// ONNX Runtime initialization (shared with speaker module)
-var (
-	onnxRuntimeInitOnce sync.Once
-	onnxRuntimeInitErr  error
-)
-
-func initONNXRuntime() error {
-	onnxRuntimeInitOnce.Do(func() {
-		onnxRuntimeInitErr = ort.InitializeEnvironment()
-	})
-	return onnxRuntimeInitErr
 }

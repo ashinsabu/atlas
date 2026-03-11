@@ -9,6 +9,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/ashinsabu/atlas/internal/monitor"
 )
 
 const maxTranscriptLines = 200
@@ -16,33 +18,39 @@ const maxTranscriptLines = 200
 // Model is the bubbletea model for the 4-pane debug TUI.
 type Model struct {
 	// Pane 1 — AUDIO
-	chunkN   int
-	rms, vad float32
-	speaking bool
+	chunkN     int
+	rms, vad   float32
+	speaking   bool
 	speakStart time.Time
 
 	// Pane 2 — PIPELINE
 	sttState   string // "idle" | "transcribing"
 	queueDepth int
 
+	// Speaker verification state (last result for the most recent segment)
+	lastSpeakerName     string
+	lastSpeakerScore    float32
+	lastSpeakerAccepted bool
+	hasSpeakerResult    bool // false until first segment is verified
+
 	// Pane 3 — TRANSCRIPT
 	lines        []string
 	scrollOffset int // index of last visible line
 
-	// Pane 4 — TIMINGS
-	lastSTTMs  int64
-	totalSegs  int
-	totalSTTMs int64 // running sum for avg
+	// Pane 4 — STATS
+	tracker *monitor.Tracker
+	snap    monitor.Snapshot
 
 	width, height int
 
 	cancel context.CancelFunc
 }
 
-func newModel(cancel context.CancelFunc) Model {
+func newModel(cancel context.CancelFunc, tracker *monitor.Tracker) Model {
 	return Model{
 		sttState: "idle",
 		cancel:   cancel,
+		tracker:  tracker,
 	}
 }
 
@@ -63,7 +71,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 
 	case TickMsg:
-		// Re-arm the ticker for live duration updates.
+		// Re-arm the ticker and refresh the stats snapshot for the STATS pane.
+		if m.tracker != nil {
+			m.snap = m.tracker.Snapshot()
+		}
 		return m, tickCmd()
 
 	case ChunkMsg:
@@ -77,12 +88,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case SegmentStartMsg:
 		m.sttState = "transcribing"
-		m.totalSegs++
 
 	case TranscriptionMsg:
 		m.sttState = "idle"
-		m.lastSTTMs = msg.ElapsedMs
-		m.totalSTTMs += msg.ElapsedMs
 		m = m.addLine(fmt.Sprintf("> %s", msg.Text))
 
 	case TranscriptionEmptyMsg:
@@ -97,6 +105,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case QueueDepthMsg:
 		m.queueDepth = msg.Depth
+
+	case SpeakerMsg:
+		m.lastSpeakerName = msg.Name
+		m.lastSpeakerScore = msg.Score
+		m.lastSpeakerAccepted = msg.Accepted
+		m.hasSpeakerResult = true
+		// Also emit to transcript so speaker result appears inline with the text.
+		if msg.Accepted {
+			m = m.addLine(fmt.Sprintf("  └ [%s] %.2f ✓", msg.Name, msg.Score))
+		} else {
+			m = m.addLine(fmt.Sprintf("  └ [%s] %.2f ✗", msg.Name, msg.Score))
+		}
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -145,10 +165,10 @@ func (m Model) View() string {
 	audioPane := m.renderAudioPane(leftInner, paneInnerH)
 	pipelinePane := m.renderPipelinePane(rightInner, paneInnerH)
 	transcriptPane := m.renderTranscriptPane(leftInner, botH-2)
-	timingsPane := m.renderTimingsPane(rightInner, botH-2)
+	statsPane := m.renderStatsPane(rightInner, botH-2)
 
 	topRow := lipgloss.JoinHorizontal(lipgloss.Top, audioPane, pipelinePane)
-	botRow := lipgloss.JoinHorizontal(lipgloss.Top, transcriptPane, timingsPane)
+	botRow := lipgloss.JoinHorizontal(lipgloss.Top, transcriptPane, statsPane)
 	main := lipgloss.JoinVertical(lipgloss.Left, topRow, botRow)
 
 	statusBar := stGray.Render("  ↑↓/jk scroll transcript · q quit")
@@ -188,6 +208,19 @@ func (m Model) renderPipelinePane(w, h int) string {
 		fmt.Sprintf("%d segments pending", m.queueDepth),
 	)))
 
+	// SPK row: shows speaker verification result for the last segment.
+	if m.hasSpeakerResult {
+		if m.lastSpeakerAccepted {
+			sb.WriteString(fmt.Sprintf("SPK    %s\n",
+				stGreen.Render(fmt.Sprintf("[%s] %.2f ✓", m.lastSpeakerName, m.lastSpeakerScore))))
+		} else {
+			sb.WriteString(fmt.Sprintf("SPK    %s\n",
+				stRed.Render(fmt.Sprintf("[%s] %.2f ✗", m.lastSpeakerName, m.lastSpeakerScore))))
+		}
+	} else {
+		sb.WriteString(fmt.Sprintf("SPK    %s\n", stGray.Render("—")))
+	}
+
 	return paneStyle.Width(w).Height(h).Render(
 		headerStyle.Render("PIPELINE") + "\n" + sb.String(),
 	)
@@ -216,6 +249,12 @@ func (m Model) renderTranscriptPane(w, h int) string {
 			rows = append(rows, stCyan.Render(line))
 		case strings.HasPrefix(line, "✗"):
 			rows = append(rows, stRed.Render(line))
+		case strings.HasSuffix(line, "✗"):
+			// Unknown speaker annotation (e.g. "  └ [Unknown] 0.42 ✗")
+			rows = append(rows, stRed.Render(line))
+		case strings.HasSuffix(line, "✓"):
+			// Accepted speaker annotation (e.g. "  └ [Ashin] 0.81 ✓")
+			rows = append(rows, stGreen.Render(line))
 		default:
 			rows = append(rows, stGreen.Render(line))
 		}
@@ -230,20 +269,46 @@ func (m Model) renderTranscriptPane(w, h int) string {
 	)
 }
 
-func (m Model) renderTimingsPane(w, h int) string {
-	var avg int64
-	if m.totalSegs > 0 {
-		avg = m.totalSTTMs / int64(m.totalSegs)
+func (m Model) renderStatsPane(w, h int) string {
+	var sb strings.Builder
+
+	// Stage latencies — fixed display order: vad, stt, spk.
+	sb.WriteString(stGray.Render("Stage Latencies") + "\n")
+	for _, name := range []string{"vad", "stt", "spk"} {
+		s, ok := m.snap.Stages[name]
+		if !ok || s.Count == 0 {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("  %-4s  last %-8s avg %s\n",
+			strings.ToUpper(name), fmtDur(s.Last), fmtDur(s.Avg)))
 	}
 
-	content := fmt.Sprintf(
-		"Last STT        %dms\nAvg STT         %dms\nSegments total  %d\nQueue depth     %d\n",
-		m.lastSTTMs, avg, m.totalSegs, m.queueDepth,
-	)
+	sb.WriteString("\n")
+	sb.WriteString(fmt.Sprintf("Queue   %s\n",
+		stGray.Render(fmt.Sprintf("%d pending", m.queueDepth))))
+
+	// Runtime section.
+	sb.WriteString("\n")
+	sb.WriteString(stGray.Render("Runtime") + "\n")
+	sb.WriteString(fmt.Sprintf("  Goroutines   %-4d  GOMAXPROCS  %d\n",
+		m.snap.Goroutines, m.snap.GOMAXPROCS))
+	sb.WriteString(fmt.Sprintf("  Heap         %.1f MB / %.1f MB sys\n",
+		m.snap.HeapAllocMB, m.snap.HeapSysMB))
+	sb.WriteString(fmt.Sprintf("  Next GC      %.1f MB  (GC runs: %d)\n",
+		m.snap.NextGCMB, m.snap.NumGC))
 
 	return paneStyle.Width(w).Height(h).Render(
-		headerStyle.Render("TIMINGS") + "\n" + content,
+		headerStyle.Render("STATS") + "\n" + sb.String(),
 	)
+}
+
+// fmtDur formats a duration as a short human-readable string (e.g. "1.2ms", "870ms").
+func fmtDur(d time.Duration) string {
+	ms := float64(d) / float64(time.Millisecond)
+	if ms < 0.1 {
+		return fmt.Sprintf("%.0fµs", float64(d)/float64(time.Microsecond))
+	}
+	return fmt.Sprintf("%.1fms", ms)
 }
 
 // barStr renders a fixed-width cyan block bar for a value in [0,1].

@@ -44,3 +44,10 @@ type QueueDepthMsg struct {
 
 // TickMsg is sent by the 100ms ticker to drive live duration updates.
 type TickMsg struct{}
+
+// SpeakerMsg is sent after speaker verification completes for a segment.
+type SpeakerMsg struct {
+	Name     string  // Speaker name (profile name if accepted, "Unknown" if rejected)
+	Score    float32 // Cosine similarity score
+	Accepted bool    // Whether the speaker was accepted
+}
