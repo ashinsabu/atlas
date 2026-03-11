@@ -7,7 +7,7 @@
 .PHONY: setup setup-deps setup-whisper setup-whisper-fast setup-silero setup-wespeaker setup-speaker-test whisper-lib vox vox-debug build build-enroll vox-enroll speaker-test test clean help
 
 # Whisper models
-WHISPER_MODEL ?= large-v3
+WHISPER_MODEL ?= small
 WHISPER_MODEL_FAST := small
 
 # Whisper.cpp paths
@@ -143,7 +143,7 @@ vox: whisper-lib
 	go run ./cmd/vox -whisper $(WHISPER_MODEL_PATH)
 
 vox-debug: whisper-lib
-	go run ./cmd/vox -debug -whisper $(WHISPER_MODEL_PATH)
+	go run ./cmd/vox -debug $(if $(MODELS),-models $(MODELS),-whisper $(WHISPER_MODEL_PATH))
 
 #══════════════════════════════════════════════════════════════
 # Speaker verification
@@ -216,7 +216,8 @@ help:
 	@echo ""
 	@echo "Run:"
 	@echo "  make vox                - Start voice assistant"
-	@echo "  make vox-debug          - Start with debug TUI"
+	@echo "  make vox-debug                              - Start with debug TUI"
+	@echo "  make vox-debug MODELS=distil-large-v3,small - Side-by-side model comparison"
 	@echo ""
 	@echo "Speaker Verification:"
 	@echo "  make vox-enroll         - Interactive live enrollment (mic recording)"

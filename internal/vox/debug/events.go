@@ -51,3 +51,10 @@ type SpeakerMsg struct {
 	Score    float32 // Cosine similarity score
 	Accepted bool    // Whether the speaker was accepted
 }
+
+// CompareTranscriptionMsg is sent when a secondary STT engine finishes.
+type CompareTranscriptionMsg struct {
+	Model     string
+	Text      string // empty string = model returned nothing
+	ElapsedMs int64
+}

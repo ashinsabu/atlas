@@ -29,6 +29,7 @@ import (
 	"github.com/ashinsabu/atlas/internal/vox/debug"
 	"github.com/ashinsabu/atlas/internal/vox/speaker"
 	"github.com/ashinsabu/atlas/internal/vox/speech"
+	"github.com/ashinsabu/atlas/internal/vox/stt"
 )
 
 const (
@@ -55,6 +56,7 @@ func main() {
 	whisperModel := flag.String("whisper", v.WhisperModel, "Path to Whisper model (empty = auto-detect)")
 	sileroModel := flag.String("silero", v.SileroModel, "Path to Silero VAD model")
 	debugMode := flag.Bool("debug", false, "Enable debug TUI")
+	modelsFlag := flag.String("models", "", "Comma-separated model names/paths for side-by-side comparison (debug only). First = primary.")
 	logLevel := flag.String("log-level", v.LogLevel, "Log level: debug, info, warn, error")
 	flag.Parse()
 
@@ -66,10 +68,26 @@ func main() {
 	if modelPath == "" {
 		modelPath = findWhisperModel()
 	}
-	if modelPath == "" {
-		fmt.Fprintln(os.Stderr, "Error: Whisper model not found")
-		fmt.Fprintln(os.Stderr, "Run: make setup")
-		os.Exit(1)
+
+	// Build the ordered list of model paths and display names.
+	// -models overrides -whisper and allows N engines for side-by-side comparison.
+	var allModelPaths []string
+	var allModelNames []string
+	if *modelsFlag != "" {
+		for _, raw := range strings.Split(*modelsFlag, ",") {
+			p := resolveModelPath(strings.TrimSpace(raw))
+			allModelPaths = append(allModelPaths, p)
+			allModelNames = append(allModelNames, modelDisplayName(p))
+		}
+		modelPath = allModelPaths[0] // -models overrides -whisper
+	} else {
+		if modelPath == "" {
+			fmt.Fprintln(os.Stderr, "Error: Whisper model not found")
+			fmt.Fprintln(os.Stderr, "Run: make setup")
+			os.Exit(1)
+		}
+		allModelPaths = []string{modelPath}
+		allModelNames = []string{modelDisplayName(modelPath)}
 	}
 
 	// Build audio config: enable debug logs in debug mode.
@@ -133,14 +151,16 @@ func main() {
 	}
 
 	if *debugMode {
-		runDebug(pipelineCfg, modelPath, *sileroModel)
+		runDebug(pipelineCfg, *sileroModel, allModelNames, allModelPaths)
 	} else {
 		runNormal(pipelineCfg, modelPath, *sileroModel, v.Name)
 	}
 }
 
 // runDebug runs the pipeline with the bubbletea TUI.
-func runDebug(cfg vox.PipelineConfig, modelPath, sileroModel string) {
+// allModelNames[0] and allModelPaths[0] are the primary model.
+// allModelPaths[1:] are built into compare STT engines (side-by-side debug comparison).
+func runDebug(cfg vox.PipelineConfig, sileroModel string, allModelNames, allModelPaths []string) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Signal handling: SIGINT/SIGTERM cancel context, which shuts down the pipeline,
@@ -154,13 +174,37 @@ func runDebug(cfg vox.PipelineConfig, modelPath, sileroModel string) {
 
 	// Build TUI + debugger before creating the pipeline so the pipeline can use
 	// it from the very first chunk.
-	prog, dbg, tracker := debug.New(cancel)
+	prog, dbg, tracker := debug.New(cancel, allModelNames)
 	cfg.Debugger = dbg
 	cfg.Monitor = tracker
 
 	fmt.Printf("%sLoading models...%s\n", colorGray, colorReset)
-	fmt.Printf("%s  Whisper: %s%s\n", colorGray, filepath.Base(modelPath), colorReset)
+	for i, p := range allModelPaths {
+		label := "Whisper"
+		if i > 0 {
+			label = fmt.Sprintf("Compare[%d]", i)
+		}
+		fmt.Printf("%s  %s: %s%s\n", colorGray, label, filepath.Base(p), colorReset)
+	}
 	fmt.Printf("%s  Silero:  %s%s\n", colorGray, filepath.Base(sileroModel), colorReset)
+
+	// Build compare STT engines (nil in single-model mode).
+	for i, path := range allModelPaths[1:] {
+		eng, err := stt.NewWhisper(stt.WhisperConfig{
+			ModelPath:     path,
+			Language:      cfg.Language,
+			InitialPrompt: cfg.WhisperPrompt,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: compare model %q: %v\n", allModelNames[i+1], err)
+			continue
+		}
+		defer eng.Close()
+		cfg.CompareSTTs = append(cfg.CompareSTTs, vox.CompareSTT{
+			Name:   allModelNames[i+1],
+			Engine: eng,
+		})
+	}
 
 	pipeline, err := vox.NewPipeline(cfg)
 	if err != nil {
@@ -264,6 +308,23 @@ func setupSlog(level string) {
 		l = slog.LevelInfo
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: l})))
+}
+
+// resolveModelPath converts a short model name (e.g. "large-v3") to its file path.
+// If the name contains a "/" or ends with ".bin", it is used as-is (full path).
+func resolveModelPath(name string) string {
+	if strings.Contains(name, "/") || strings.HasSuffix(name, ".bin") {
+		return name
+	}
+	return "models/ggml-" + name + ".bin"
+}
+
+// modelDisplayName extracts a short display name from a model file path.
+// e.g. "models/ggml-large-v3.bin" → "large-v3"
+func modelDisplayName(path string) string {
+	base := filepath.Base(path)
+	base = strings.TrimPrefix(base, "ggml-")
+	return strings.TrimSuffix(base, ".bin")
 }
 
 func findWhisperModel() string {

@@ -13,19 +13,21 @@ type Debugger interface {
 	OnWakeWord(command string)
 	OnQueueDepth(n int)
 	OnSpeakerVerified(name string, score float32, accepted bool)
+	OnCompareTranscription(model, text string, elapsedMs int64)
 }
 
 // NopDebugger is a no-op Debugger used when debug mode is disabled.
 type NopDebugger struct{}
 
-func (NopDebugger) OnChunk(_ int, _, _ float32, _ bool)           {}
-func (NopDebugger) OnSegmentStart(_ float64)                       {}
-func (NopDebugger) OnTranscription(_ string, _ int64)             {}
-func (NopDebugger) OnTranscriptionEmpty(_ int64)                   {}
-func (NopDebugger) OnTranscriptionError(_ error)                   {}
-func (NopDebugger) OnWakeWord(_ string)                            {}
-func (NopDebugger) OnQueueDepth(_ int)                             {}
-func (NopDebugger) OnSpeakerVerified(_ string, _ float32, _ bool) {}
+func (NopDebugger) OnChunk(_ int, _, _ float32, _ bool)                {}
+func (NopDebugger) OnSegmentStart(_ float64)                            {}
+func (NopDebugger) OnTranscription(_ string, _ int64)                  {}
+func (NopDebugger) OnTranscriptionEmpty(_ int64)                        {}
+func (NopDebugger) OnTranscriptionError(_ error)                        {}
+func (NopDebugger) OnWakeWord(_ string)                                 {}
+func (NopDebugger) OnQueueDepth(_ int)                                  {}
+func (NopDebugger) OnSpeakerVerified(_ string, _ float32, _ bool)      {}
+func (NopDebugger) OnCompareTranscription(_ string, _ string, _ int64) {}
 
 // UIDebugger forwards pipeline events to a bubbletea program as messages.
 // tea.Program.Send is goroutine-safe — safe to call from the audio callback,
@@ -64,4 +66,8 @@ func (u *UIDebugger) OnQueueDepth(n int) {
 
 func (u *UIDebugger) OnSpeakerVerified(name string, score float32, accepted bool) {
 	u.prog.Send(SpeakerMsg{Name: name, Score: score, Accepted: accepted})
+}
+
+func (u *UIDebugger) OnCompareTranscription(model, text string, elapsedMs int64) {
+	u.prog.Send(CompareTranscriptionMsg{Model: model, Text: text, ElapsedMs: elapsedMs})
 }

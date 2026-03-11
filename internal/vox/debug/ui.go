@@ -35,23 +35,37 @@ type Model struct {
 
 	// Pane 3 — TRANSCRIPT
 	lines        []string
-	scrollOffset int // index of last visible line
+	scrollOffset int // index of last visible line (single-model mode only)
 
 	// Pane 4 — STATS
 	tracker *monitor.Tracker
 	snap    monitor.Snapshot
+
+	// Multi-model state (populated when len(modelNames) > 1).
+	modelNames       []string            // ["large-v3", "distil"] — ordered; [0] = primary
+	compareLines     map[string][]string // per-compare-model transcript lines
+	compareSTTStates map[string]string   // "idle" | "transcribing" per compare model
 
 	width, height int
 
 	cancel context.CancelFunc
 }
 
-func newModel(cancel context.CancelFunc, tracker *monitor.Tracker) Model {
-	return Model{
-		sttState: "idle",
-		cancel:   cancel,
-		tracker:  tracker,
+func newModel(cancel context.CancelFunc, tracker *monitor.Tracker, modelNames []string) Model {
+	m := Model{
+		sttState:   "idle",
+		cancel:     cancel,
+		tracker:    tracker,
+		modelNames: modelNames,
 	}
+	if len(modelNames) > 1 {
+		m.compareLines = make(map[string][]string)
+		m.compareSTTStates = make(map[string]string)
+		for _, name := range modelNames[1:] {
+			m.compareSTTStates[name] = "idle"
+		}
+	}
+	return m
 }
 
 func (m Model) Init() tea.Cmd {
@@ -88,6 +102,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case SegmentStartMsg:
 		m.sttState = "transcribing"
+		for k := range m.compareSTTStates {
+			m.compareSTTStates[k] = "transcribing"
+		}
+
+	case CompareTranscriptionMsg:
+		m.compareSTTStates[msg.Model] = "idle"
+		line := "> " + msg.Text
+		if msg.Text == "" {
+			line = stGray.Render("—")
+		}
+		m.compareLines[msg.Model] = append(m.compareLines[msg.Model], line)
+		if len(m.compareLines[msg.Model]) > maxTranscriptLines {
+			m.compareLines[msg.Model] = m.compareLines[msg.Model][1:]
+		}
 
 	case TranscriptionMsg:
 		m.sttState = "idle"
@@ -150,7 +178,13 @@ func (m Model) View() string {
 	if m.width == 0 {
 		return "Initializing..."
 	}
+	if len(m.modelNames) > 1 {
+		return m.viewMultiModel()
+	}
+	return m.viewSingleModel()
+}
 
+func (m Model) viewSingleModel() string {
 	// Split width into two equal halves; each pane gets its share minus borders.
 	halfW := m.width / 2
 	leftInner := halfW - 4  // 2 border chars + 2 padding chars per side
@@ -172,6 +206,43 @@ func (m Model) View() string {
 	main := lipgloss.JoinVertical(lipgloss.Left, topRow, botRow)
 
 	statusBar := stGray.Render("  ↑↓/jk scroll transcript · q quit")
+	return lipgloss.JoinVertical(lipgloss.Left, main, statusBar)
+}
+
+func (m Model) viewMultiModel() string {
+	n := len(m.modelNames)
+
+	usableH := m.height - 1
+	topH := usableH / 4
+	statsH := usableH / 4
+	transcriptH := usableH - topH - statsH
+
+	// Top row: AUDIO (1/3 width) + PIPELINE (2/3 width).
+	audioW := m.width / 3
+	audioPane := m.renderAudioPane(audioW-4, topH-2)
+	pipelinePane := m.renderPipelinePane(m.width-audioW-4, topH-2)
+	topRow := lipgloss.JoinHorizontal(lipgloss.Top, audioPane, pipelinePane)
+
+	// Transcript columns — side by side.
+	colW := m.width / n
+	var cols []string
+	cols = append(cols,
+		m.renderTranscriptColPane(colW-4, transcriptH-2, m.modelNames[0], m.lines, m.sttState))
+	for i, name := range m.modelNames[1:] {
+		innerW := colW - 4
+		if i == len(m.modelNames)-2 {
+			innerW = m.width - (n-1)*colW - 4
+		}
+		cols = append(cols,
+			m.renderTranscriptColPane(innerW, transcriptH-2, name, m.compareLines[name], m.compareSTTStates[name]))
+	}
+	transcriptRow := lipgloss.JoinHorizontal(lipgloss.Top, cols...)
+
+	// Single full-width stats pane.
+	statsPane := m.renderCombinedStatsPane(m.width-4, statsH-2)
+
+	main := lipgloss.JoinVertical(lipgloss.Left, topRow, transcriptRow, statsPane)
+	statusBar := stGray.Render("  q quit")
 	return lipgloss.JoinVertical(lipgloss.Left, main, statusBar)
 }
 
@@ -227,7 +298,7 @@ func (m Model) renderPipelinePane(w, h int) string {
 }
 
 func (m Model) renderTranscriptPane(w, h int) string {
-	innerH := h
+	innerH := h - 1 // reserve 1 line for the "TRANSCRIPT" header row
 	if innerH < 1 {
 		innerH = 1
 	}
@@ -300,6 +371,79 @@ func (m Model) renderStatsPane(w, h int) string {
 	return paneStyle.Width(w).Height(h).Render(
 		headerStyle.Render("STATS") + "\n" + sb.String(),
 	)
+}
+
+// renderTranscriptColPane renders a single transcript column for multi-model mode.
+// Lines auto-scroll to the bottom; no manual scroll in this mode.
+func (m Model) renderTranscriptColPane(w, h int, name string, lines []string, sttState string) string {
+	innerH := h - 1 // reserve 1 line for the header row
+	if innerH < 1 {
+		innerH = 1
+	}
+
+	end := len(lines)
+	start := end - innerH
+	if start < 0 {
+		start = 0
+	}
+
+	var rows []string
+	for _, line := range lines[start:end] {
+		switch {
+		case strings.HasPrefix(line, "◆"):
+			rows = append(rows, stCyan.Render(line))
+		case strings.HasPrefix(line, "✗"):
+			rows = append(rows, stRed.Render(line))
+		case strings.HasSuffix(line, "✗"):
+			rows = append(rows, stRed.Render(line))
+		case strings.HasSuffix(line, "✓"):
+			rows = append(rows, stGreen.Render(line))
+		default:
+			rows = append(rows, stGreen.Render(line))
+		}
+	}
+	for len(rows) < innerH {
+		rows = append(rows, "")
+	}
+
+	header := headerStyle.Render(name)
+	if sttState == "transcribing" {
+		header += " " + stYellow.Render("⏳")
+	}
+	return paneStyle.Width(w).Height(h).Render(header + "\n" + strings.Join(rows, "\n"))
+}
+
+// renderCombinedStatsPane renders a single full-width stats pane for multi-model mode.
+// Rows: one per model (avg, max, runs), then process-wide runtime.
+func (m Model) renderCombinedStatsPane(w, h int) string {
+	var sb strings.Builder
+
+	// Header row.
+	sb.WriteString(fmt.Sprintf("  %-22s  %s  %s  %s\n",
+		stGray.Render("model"),
+		stGray.Render("avg      "),
+		stGray.Render("max      "),
+		stGray.Render("runs")))
+
+	for i, name := range m.modelNames {
+		stageName := "stt"
+		if i > 0 {
+			stageName = "stt:" + name
+		}
+		s, ok := m.snap.Stages[stageName]
+		if !ok || s.Count == 0 {
+			sb.WriteString(fmt.Sprintf("  %-22s  %s\n", name, stGray.Render("—")))
+		} else {
+			sb.WriteString(fmt.Sprintf("  %-22s  %-9s  %-9s  %d\n",
+				name, fmtDur(s.Avg), fmtDur(s.Max), s.Count))
+		}
+	}
+
+	sb.WriteString(fmt.Sprintf("\n  %s\n",
+		stGray.Render(fmt.Sprintf("Goroutines %d   Heap %.1f MB   Queue %d pending",
+			m.snap.Goroutines, m.snap.HeapAllocMB, m.queueDepth))))
+
+	return paneStyle.Width(w).Height(h).Render(headerStyle.Render("STATS") + "\n" + sb.String())
 }
 
 // fmtDur formats a duration as a short human-readable string (e.g. "1.2ms", "870ms").

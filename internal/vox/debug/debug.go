@@ -14,9 +14,13 @@ import (
 // cancel is called when the user presses q or ctrl+c inside the TUI.
 // The caller wires the returned tracker into PipelineConfig.Monitor so the
 // pipeline records stage timings that the TUI reads on each tick.
-func New(cancel context.CancelFunc) (*tea.Program, Debugger, *monitor.Tracker) {
+//
+// modelNames contains ordered display names for all models: modelNames[0] is
+// the primary model; modelNames[1:] are compare models. Single-model mode
+// (current layout) activates when len(modelNames) == 1.
+func New(cancel context.CancelFunc, modelNames []string) (*tea.Program, Debugger, *monitor.Tracker) {
 	tracker := monitor.New()
-	m := newModel(cancel, tracker)
+	m := newModel(cancel, tracker, modelNames)
 	prog := tea.NewProgram(m, tea.WithAltScreen())
 	dbg := &UIDebugger{prog: prog}
 	return prog, dbg, tracker

@@ -24,6 +24,13 @@ import (
 	"github.com/ashinsabu/atlas/internal/vox/wakeword"
 )
 
+// CompareSTT holds a named secondary STT engine for debug comparison.
+// Only populated in debug mode via PipelineConfig.CompareSTTs.
+type CompareSTT struct {
+	Name   string
+	Engine stt.STT
+}
+
 // Pipeline orchestrates the voice processing stages.
 type Pipeline struct {
 	audio    audio.Source
@@ -31,6 +38,8 @@ type Pipeline struct {
 	stt      stt.STT
 	wakeword *wakeword.Detector
 	verifier *speaker.Verifier // nil = speaker verification disabled (pass-all)
+
+	compareSTTs []CompareSTT // nil in normal mode; populated in debug multi-model mode
 
 	// segCh: audio callback → relay goroutine. Small buffer; relay drains it instantly.
 	segCh chan speech.SpeechSegment
@@ -90,6 +99,9 @@ type PipelineConfig struct {
 
 	// WakeWords sets the wake phrases. If empty, the detector uses no default wake words.
 	WakeWords []string
+
+	// CompareSTTs holds secondary STT engines for debug comparison. Only used in debug mode.
+	CompareSTTs []CompareSTT
 }
 
 // DefaultPipelineConfig returns sensible defaults.
@@ -144,16 +156,17 @@ func NewPipeline(cfg PipelineConfig) (*Pipeline, error) {
 	}
 
 	p := &Pipeline{
-		audio:    audioSource,
-		speech:   speechDetector,
-		stt:      sttEngine,
-		wakeword: wakewordDetector,
-		verifier: cfg.Speaker,
-		segCh:    make(chan speech.SpeechSegment, 4),
-		sttCh:    make(chan speech.SpeechSegment, 1),
-		debugger: dbg,
-		mon:      cfg.Monitor,
-		status:   "initialized",
+		audio:       audioSource,
+		speech:      speechDetector,
+		stt:         sttEngine,
+		wakeword:    wakewordDetector,
+		verifier:    cfg.Speaker,
+		compareSTTs: cfg.CompareSTTs,
+		segCh:       make(chan speech.SpeechSegment, 4),
+		sttCh:       make(chan speech.SpeechSegment, 1),
+		debugger:    dbg,
+		mon:         cfg.Monitor,
+		status:      "initialized",
 	}
 
 	// OnFrame is called inside speech.Process every 32ms.
@@ -251,7 +264,7 @@ func (p *Pipeline) processChunk(chunk []byte) {
 func (p *Pipeline) processSegment(seg *speech.SpeechSegment) {
 	p.debugger.OnSegmentStart(seg.Seconds())
 
-	// Transcribe.
+	// Transcribe with primary model.
 	p.setStatus("transcribing")
 	t0 := time.Now()
 	text, err := p.stt.Transcribe(seg.Audio)
@@ -276,6 +289,17 @@ func (p *Pipeline) processSegment(seg *speech.SpeechSegment) {
 	}
 
 	p.debugger.OnTranscription(text, elapsed.Milliseconds())
+
+	// Run compare STTs sequentially after primary result is delivered.
+	for _, cmp := range p.compareSTTs {
+		t0 := time.Now()
+		cmpText, _ := cmp.Engine.Transcribe(seg.Audio)
+		cmpElapsed := time.Since(t0)
+		if p.mon != nil {
+			p.mon.Record("stt:"+cmp.Name, cmpElapsed)
+		}
+		p.debugger.OnCompareTranscription(cmp.Name, strings.TrimSpace(cmpText), cmpElapsed.Milliseconds())
+	}
 
 	// Check for wake word. OnWake sets p.wakeJustFired when the wake phrase is
 	// detected for the first time in this segment (not on follow-up Listening segments).
