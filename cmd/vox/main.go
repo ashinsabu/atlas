@@ -111,7 +111,7 @@ func main() {
 	wakewords := v.Wakewords
 	if len(wakewords) == 0 {
 		name := strings.ToLower(v.Name)
-		wakewords = []string{"hey " + name, "hi " + name, name}
+		wakewords = []string{"hey " + name, "hi " + name, "yo " + name}
 	}
 
 	// Build pipeline config (Debugger filled in below based on mode).
@@ -143,8 +143,8 @@ func main() {
 				enc.Close()
 			} else {
 				verifier := speaker.NewVerifier(enc, profile, float32(v.Speaker.Threshold))
-			verifier.SetShortThreshold(float32(v.Speaker.ShortThreshold), v.Speaker.ShortThresholdS)
-			pipelineCfg.Speaker = verifier
+				verifier.SetShortThreshold(float32(v.Speaker.ShortThreshold), v.Speaker.ShortThresholdS)
+				pipelineCfg.Speaker = verifier
 				slog.Info("speaker verification enabled (wake-word-gated)", "speaker", profile.SpeakerName, "threshold", v.Speaker.Threshold)
 			}
 		}
