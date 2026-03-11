@@ -17,29 +17,36 @@ import (
 
 // FBankConfig holds filterbank extraction parameters.
 type FBankConfig struct {
-	SampleRate     int
-	FrameSize      int     // Samples per frame (25ms = 400 at 16kHz)
-	HopSize        int     // Samples between frames (10ms = 160 at 16kHz)
-	NumMelBins     int     // Number of mel filterbanks (typically 80)
-	LowFreq        float64 // Lowest frequency for mel banks
-	HighFreq       float64 // Highest frequency (0 = Nyquist)
-	PreEmphasis    float64 // Pre-emphasis coefficient (0.97 typical)
-	UseLogMel      bool    // Apply log to mel energies
-	ApplyCMVN      bool    // Apply cepstral mean/variance normalization
+	SampleRate      int
+	FrameSize       int     // Samples per frame (25ms = 400 at 16kHz)
+	HopSize         int     // Samples between frames (10ms = 160 at 16kHz)
+	NumMelBins      int     // Number of mel filterbanks (typically 80)
+	LowFreq         float64 // Lowest frequency for mel banks
+	HighFreq        float64 // Highest frequency (0 = Nyquist, negative = offset from Nyquist)
+	PreEmphasis     float64 // Pre-emphasis coefficient (0.97 typical)
+	UseLogMel  bool // Apply log to mel energies
+	ApplyCMN   bool // Apply cepstral mean normalization (WeSpeaker)
+	AmplitudeScale  float32 // Scale factor for audio amplitude (WeSpeaker uses 32768)
+	UsePoveyWindow  bool    // Use Povey window (Kaldi-style) instead of Hamming
+	RemoveDCOffset  bool    // Remove DC offset from audio before processing
 }
 
 // DefaultFBankConfig returns standard parameters for speaker embedding.
+// Matches sherpa-onnx/Kaldi defaults: 80 mel bins, 25ms frame, 10ms hop, Povey window.
 func DefaultFBankConfig() FBankConfig {
 	return FBankConfig{
-		SampleRate:  16000,
-		FrameSize:   400,  // 25ms at 16kHz
-		HopSize:     160,  // 10ms at 16kHz
-		NumMelBins:  80,
-		LowFreq:     20.0,
-		HighFreq:    0, // Will be set to Nyquist
+		SampleRate:     16000,
+		FrameSize:      400,    // 25ms at 16kHz
+		HopSize:        160,    // 10ms at 16kHz
+		NumMelBins:     80,
+		LowFreq:        20.0,
+		HighFreq:       -400.0, // Nyquist - 400 = 7600Hz (sherpa-onnx default)
 		PreEmphasis: 0.97,
 		UseLogMel:   true,
-		ApplyCMVN:   true,
+		ApplyCMN:    true, // Mean normalization (WeSpeaker standard)
+		AmplitudeScale: 32768,  // WeSpeaker expects int16 scale audio
+		UsePoveyWindow: true,   // Kaldi-style window (required for WeSpeaker)
+		RemoveDCOffset: true,   // Remove DC offset (sherpa-onnx default)
 	}
 }
 
@@ -51,17 +58,44 @@ func ComputeFBank(samples []float32, cfg FBankConfig) [][]float32 {
 		return nil
 	}
 
-	// Set high frequency to Nyquist if not specified
+	// Set high frequency (negative means offset from Nyquist)
+	nyquist := float64(cfg.SampleRate) / 2
 	highFreq := cfg.HighFreq
 	if highFreq <= 0 {
-		highFreq = float64(cfg.SampleRate) / 2
+		highFreq = nyquist + highFreq // e.g., -400 -> 7600 Hz
+	}
+	if highFreq > nyquist {
+		highFreq = nyquist
+	}
+
+	// Make a working copy
+	working := make([]float32, len(samples))
+	copy(working, samples)
+
+	// Remove DC offset if configured
+	if cfg.RemoveDCOffset {
+		var sum float64
+		for _, s := range working {
+			sum += float64(s)
+		}
+		mean := float32(sum / float64(len(working)))
+		for i := range working {
+			working[i] -= mean
+		}
+	}
+
+	// Scale amplitude if configured (WeSpeaker expects int16 range)
+	if cfg.AmplitudeScale > 0 {
+		for i := range working {
+			working[i] *= cfg.AmplitudeScale
+		}
 	}
 
 	// Pre-emphasis
-	preEmph := make([]float32, len(samples))
-	preEmph[0] = samples[0]
-	for i := 1; i < len(samples); i++ {
-		preEmph[i] = samples[i] - float32(cfg.PreEmphasis)*samples[i-1]
+	preEmph := make([]float32, len(working))
+	preEmph[0] = working[0]
+	for i := 1; i < len(working); i++ {
+		preEmph[i] = working[i] - float32(cfg.PreEmphasis)*working[i-1]
 	}
 
 	// Compute number of frames
@@ -76,8 +110,13 @@ func ComputeFBank(samples []float32, cfg FBankConfig) [][]float32 {
 		fftSize *= 2
 	}
 
-	// Create Hamming window
-	window := makeHammingWindow(cfg.FrameSize)
+	// Create window function
+	var window []float64
+	if cfg.UsePoveyWindow {
+		window = makePoveyWindow(cfg.FrameSize)
+	} else {
+		window = makeHammingWindow(cfg.FrameSize)
+	}
 
 	// Create mel filterbank
 	melFilter := createMelFilterbank(cfg.NumMelBins, fftSize, cfg.SampleRate, cfg.LowFreq, highFreq)
@@ -113,9 +152,9 @@ func ComputeFBank(samples []float32, cfg FBankConfig) [][]float32 {
 		features[i] = melEnergies
 	}
 
-	// Apply CMVN (per-utterance)
-	if cfg.ApplyCMVN && len(features) > 0 {
-		features = applyCMVN(features)
+	// Apply normalization (per-utterance)
+	if len(features) > 0 && cfg.ApplyCMN {
+		features = applyCMN(features)
 	}
 
 	return features
@@ -126,6 +165,20 @@ func makeHammingWindow(size int) []float64 {
 	window := make([]float64, size)
 	for i := 0; i < size; i++ {
 		window[i] = 0.54 - 0.46*math.Cos(2*math.Pi*float64(i)/float64(size-1))
+	}
+	return window
+}
+
+// makePoveyWindow creates a Povey window (Kaldi-style).
+// Povey window is a Hann window raised to the power of 0.85.
+// Formula: w[n] = (0.5 - 0.5 * cos(2*pi*n/(N-1)))^0.85
+func makePoveyWindow(size int) []float64 {
+	window := make([]float64, size)
+	for i := 0; i < size; i++ {
+		// Hann window value
+		hann := 0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(size-1))
+		// Raise to power 0.85 for Povey window
+		window[i] = math.Pow(hann, 0.85)
 	}
 	return window
 }
@@ -223,8 +276,9 @@ func applyMelFilterbank(powerSpec []float32, filterbank [][]float32) []float32 {
 	return melEnergies
 }
 
-// applyCMVN applies cepstral mean and variance normalization per utterance.
-func applyCMVN(features [][]float32) [][]float32 {
+// applyCMN applies cepstral mean normalization per utterance (WeSpeaker standard).
+// Only subtracts mean, does NOT normalize variance.
+func applyCMN(features [][]float32) [][]float32 {
 	if len(features) == 0 {
 		return features
 	}
@@ -232,7 +286,7 @@ func applyCMVN(features [][]float32) [][]float32 {
 	numFrames := len(features)
 	numBins := len(features[0])
 
-	// Compute mean
+	// Compute mean across time dimension (dim 0)
 	mean := make([]float64, numBins)
 	for i := 0; i < numFrames; i++ {
 		for j := 0; j < numBins; j++ {
@@ -243,27 +297,12 @@ func applyCMVN(features [][]float32) [][]float32 {
 		mean[j] /= float64(numFrames)
 	}
 
-	// Compute variance
-	variance := make([]float64, numBins)
-	for i := 0; i < numFrames; i++ {
-		for j := 0; j < numBins; j++ {
-			diff := float64(features[i][j]) - mean[j]
-			variance[j] += diff * diff
-		}
-	}
-	for j := 0; j < numBins; j++ {
-		variance[j] /= float64(numFrames)
-		if variance[j] < 1e-10 {
-			variance[j] = 1e-10
-		}
-	}
-
-	// Normalize
+	// Subtract mean only (no variance normalization)
 	result := make([][]float32, numFrames)
 	for i := 0; i < numFrames; i++ {
 		result[i] = make([]float32, numBins)
 		for j := 0; j < numBins; j++ {
-			result[i][j] = float32((float64(features[i][j]) - mean[j]) / math.Sqrt(variance[j]))
+			result[i][j] = float32(float64(features[i][j]) - mean[j])
 		}
 	}
 

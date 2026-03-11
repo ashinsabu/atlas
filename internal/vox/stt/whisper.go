@@ -15,9 +15,26 @@ import (
 	"io"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/ggerganov/whisper.cpp/bindings/go/pkg/whisper"
 )
+
+// TokenTiming represents a transcribed token with timing information.
+// Used for word-level alignment in speaker diarization.
+type TokenTiming struct {
+	// Transcribed token text
+	Text string
+
+	// Start time relative to audio start
+	Start time.Duration
+
+	// End time relative to audio start
+	End time.Duration
+
+	// Probability/confidence score from Whisper (0.0-1.0)
+	Probability float32
+}
 
 // WhisperConfig holds configuration for Whisper STT.
 type WhisperConfig struct {
@@ -60,6 +77,9 @@ type Whisper struct {
 	prompt      string
 }
 
+// Compile-time check that Whisper implements STT.
+var _ STT = (*Whisper)(nil)
+
 // NewWhisper creates a Whisper instance and loads the model.
 // The model is loaded once and reused for all transcriptions.
 func NewWhisper(cfg WhisperConfig) (*Whisper, error) {
@@ -100,8 +120,16 @@ func (w *Whisper) Close() error {
 	return nil
 }
 
+// Transcribe converts raw PCM audio to text.
+// Input: 16-bit little-endian PCM at 16kHz mono.
+// Implements the STT interface.
+func (w *Whisper) Transcribe(pcmData []byte) (string, error) {
+	return w.TranscribeBytes(pcmData)
+}
+
 // TranscribeBytes converts raw PCM audio to text.
 // Input: 16-bit little-endian PCM at 16kHz mono.
+// Deprecated: Use Transcribe instead.
 func (w *Whisper) TranscribeBytes(pcmData []byte) (string, error) {
 	if len(pcmData) == 0 {
 		return "", nil
@@ -151,6 +179,277 @@ func (w *Whisper) TranscribeBytes(pcmData []byte) (string, error) {
 	}
 
 	return strings.TrimSpace(sb.String()), nil
+}
+
+// TranscribeWithTimestamps converts raw PCM audio to text with word-level timing.
+// Input: 16-bit little-endian PCM at 16kHz mono.
+// Returns token timings suitable for speaker diarization alignment.
+func (w *Whisper) TranscribeWithTimestamps(pcmData []byte) ([]TokenTiming, error) {
+	if len(pcmData) == 0 {
+		return nil, nil
+	}
+
+	// Convert 16-bit PCM to float32 samples normalized to [-1.0, 1.0]
+	samples := pcmToFloat32(pcmData)
+
+	// Normalize audio levels for consistent input
+	samples = normalizeAudio(samples)
+
+	// Create processing context
+	ctx, err := w.model.NewContext()
+	if err != nil {
+		return nil, fmt.Errorf("create whisper context: %w", err)
+	}
+
+	// Configure language
+	if err := ctx.SetLanguage(w.lang); err != nil {
+		return nil, fmt.Errorf("set language: %w", err)
+	}
+
+	// Configure tuning parameters
+	ctx.SetTemperature(w.temperature)
+	ctx.SetBeamSize(w.beamSize)
+	if w.prompt != "" {
+		ctx.SetInitialPrompt(w.prompt)
+	}
+
+	// Enable token timestamps for word-level alignment
+	ctx.SetTokenTimestamps(true)
+
+	// Process audio samples
+	if err := ctx.Process(samples, nil, nil, nil); err != nil {
+		return nil, fmt.Errorf("whisper process: %w", err)
+	}
+
+	// Collect tokens with timestamps from all segments
+	var tokens []TokenTiming
+	for {
+		segment, err := ctx.NextSegment()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read segment: %w", err)
+		}
+
+		// Extract text tokens (filter out special tokens)
+		for _, tok := range segment.Tokens {
+			if !ctx.IsText(tok) {
+				continue
+			}
+
+			text := strings.TrimSpace(tok.Text)
+			if text == "" {
+				continue
+			}
+
+			tokens = append(tokens, TokenTiming{
+				Text:        text,
+				Start:       tok.Start,
+				End:         tok.End,
+				Probability: tok.P,
+			})
+		}
+	}
+
+	return tokens, nil
+}
+
+// TranscribeSamples converts float32 audio samples to text.
+// Input: float32 audio samples at 16kHz mono, normalized to [-1.0, 1.0].
+// For word-level timing, use TranscribeSamplesWithTimestamps instead.
+func (w *Whisper) TranscribeSamples(samples []float32) (string, error) {
+	if len(samples) == 0 {
+		return "", nil
+	}
+
+	// Normalize audio levels for consistent input
+	normalizedSamples := make([]float32, len(samples))
+	copy(normalizedSamples, samples)
+	normalizedSamples = normalizeAudio(normalizedSamples)
+
+	// Create processing context
+	ctx, err := w.model.NewContext()
+	if err != nil {
+		return "", fmt.Errorf("create whisper context: %w", err)
+	}
+
+	// Configure language
+	if err := ctx.SetLanguage(w.lang); err != nil {
+		return "", fmt.Errorf("set language: %w", err)
+	}
+
+	// Configure tuning parameters for accuracy
+	ctx.SetTemperature(w.temperature)
+	ctx.SetBeamSize(w.beamSize)
+	if w.prompt != "" {
+		ctx.SetInitialPrompt(w.prompt)
+	}
+
+	// Process audio samples
+	if err := ctx.Process(normalizedSamples, nil, nil, nil); err != nil {
+		return "", fmt.Errorf("whisper process: %w", err)
+	}
+
+	// Collect transcription from segments
+	var sb strings.Builder
+	for {
+		segment, err := ctx.NextSegment()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("read segment: %w", err)
+		}
+		sb.WriteString(segment.Text)
+	}
+
+	return strings.TrimSpace(sb.String()), nil
+}
+
+// TranscribeSamplesWithTimestamps converts float32 audio samples to text with timing.
+// Input: float32 audio samples at 16kHz mono, normalized to [-1.0, 1.0].
+// This avoids PCM conversion when audio is already in float32 format.
+// Note: This makes a copy of the samples buffer for normalization. If you don't
+// need to preserve the original samples, use TranscribeSamplesWithTimestampsInPlace.
+func (w *Whisper) TranscribeSamplesWithTimestamps(samples []float32) ([]TokenTiming, error) {
+	if len(samples) == 0 {
+		return nil, nil
+	}
+
+	// Normalize audio levels for consistent input
+	normalizedSamples := make([]float32, len(samples))
+	copy(normalizedSamples, samples)
+	normalizedSamples = normalizeAudio(normalizedSamples)
+
+	// Create processing context
+	ctx, err := w.model.NewContext()
+	if err != nil {
+		return nil, fmt.Errorf("create whisper context: %w", err)
+	}
+
+	// Configure language
+	if err := ctx.SetLanguage(w.lang); err != nil {
+		return nil, fmt.Errorf("set language: %w", err)
+	}
+
+	// Configure tuning parameters
+	ctx.SetTemperature(w.temperature)
+	ctx.SetBeamSize(w.beamSize)
+	if w.prompt != "" {
+		ctx.SetInitialPrompt(w.prompt)
+	}
+
+	// Enable token timestamps
+	ctx.SetTokenTimestamps(true)
+
+	// Process audio samples
+	if err := ctx.Process(normalizedSamples, nil, nil, nil); err != nil {
+		return nil, fmt.Errorf("whisper process: %w", err)
+	}
+
+	// Collect tokens with timestamps
+	var tokens []TokenTiming
+	for {
+		segment, err := ctx.NextSegment()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read segment: %w", err)
+		}
+
+		for _, tok := range segment.Tokens {
+			if !ctx.IsText(tok) {
+				continue
+			}
+
+			text := strings.TrimSpace(tok.Text)
+			if text == "" {
+				continue
+			}
+
+			tokens = append(tokens, TokenTiming{
+				Text:        text,
+				Start:       tok.Start,
+				End:         tok.End,
+				Probability: tok.P,
+			})
+		}
+	}
+
+	return tokens, nil
+}
+
+// TranscribeSamplesWithTimestampsInPlace converts float32 audio samples to text with timing.
+// Unlike TranscribeSamplesWithTimestamps, this normalizes the samples buffer in-place,
+// avoiding a ~320KB allocation for 10s of audio. The caller's buffer will be modified.
+// Use this when you don't need to preserve the original audio data.
+func (w *Whisper) TranscribeSamplesWithTimestampsInPlace(samples []float32) ([]TokenTiming, error) {
+	if len(samples) == 0 {
+		return nil, nil
+	}
+
+	// Normalize audio levels in-place (modifies caller's buffer)
+	normalizeAudio(samples)
+
+	// Create processing context
+	ctx, err := w.model.NewContext()
+	if err != nil {
+		return nil, fmt.Errorf("create whisper context: %w", err)
+	}
+
+	// Configure language
+	if err := ctx.SetLanguage(w.lang); err != nil {
+		return nil, fmt.Errorf("set language: %w", err)
+	}
+
+	// Configure tuning parameters
+	ctx.SetTemperature(w.temperature)
+	ctx.SetBeamSize(w.beamSize)
+	if w.prompt != "" {
+		ctx.SetInitialPrompt(w.prompt)
+	}
+
+	// Enable token timestamps
+	ctx.SetTokenTimestamps(true)
+
+	// Process audio samples
+	if err := ctx.Process(samples, nil, nil, nil); err != nil {
+		return nil, fmt.Errorf("whisper process: %w", err)
+	}
+
+	// Collect tokens with timestamps
+	var tokens []TokenTiming
+	for {
+		segment, err := ctx.NextSegment()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read segment: %w", err)
+		}
+
+		for _, tok := range segment.Tokens {
+			if !ctx.IsText(tok) {
+				continue
+			}
+
+			text := strings.TrimSpace(tok.Text)
+			if text == "" {
+				continue
+			}
+
+			tokens = append(tokens, TokenTiming{
+				Text:        text,
+				Start:       tok.Start,
+				End:         tok.End,
+				Probability: tok.P,
+			})
+		}
+	}
+
+	return tokens, nil
 }
 
 // ModelInfo returns info about the loaded model.

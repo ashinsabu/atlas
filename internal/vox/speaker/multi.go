@@ -135,13 +135,18 @@ func (v *MultiProfileVerifier) AuthorizeOnly(names []string) error {
 
 // Verify checks if audio matches any authorized profile.
 func (v *MultiProfileVerifier) Verify(samples []float32) (MultiVerifyResult, error) {
-	result := MultiVerifyResult{
-		AllScores: make(map[string]float32),
-	}
-
 	emb, err := v.extractor.Extract(samples)
 	if err != nil {
-		return result, fmt.Errorf("extract embedding: %w", err)
+		return MultiVerifyResult{AllScores: make(map[string]float32)}, fmt.Errorf("extract embedding: %w", err)
+	}
+	return v.VerifyEmbedding(emb), nil
+}
+
+// VerifyEmbedding checks if an embedding matches any authorized profile.
+// Use this when you already have an embedding (e.g., from word-level extraction).
+func (v *MultiProfileVerifier) VerifyEmbedding(emb []float32) MultiVerifyResult {
+	result := MultiVerifyResult{
+		AllScores: make(map[string]float32),
 	}
 
 	v.mu.RLock()
@@ -170,7 +175,7 @@ func (v *MultiProfileVerifier) Verify(samples []float32) (MultiVerifyResult, err
 		result.MatchedBy = bestName
 	}
 
-	return result, nil
+	return result
 }
 
 // ListLoaded returns the names of all loaded profiles.

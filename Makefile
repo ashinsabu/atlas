@@ -3,13 +3,15 @@
 # Quick reference:
 #   make setup      - Install all dependencies + build whisper lib
 #   make enroll     - Enroll your voice (interactive)
-#   make speaker-id - Live speaker identification
 #   make vox        - Run the Vox voice module
 
-.PHONY: setup setup-deps setup-whisper setup-speaker whisper-lib vox build test clean enroll speaker-id profiles
+.PHONY: setup setup-deps setup-whisper setup-whisper-fast setup-speaker whisper-lib vox vox-fast build test clean enroll profiles speaker-enroll speaker-list speaker-delete
 
-# Default model (large-v3 for best accuracy)
+# Whisper models
+# large-v3: Best accuracy (3GB) - use for accuracy-critical tasks
+# distil-large-v3: 6x faster, 1% WER increase (756MB) - recommended for daily use
 WHISPER_MODEL ?= large-v3
+WHISPER_MODEL_FAST := distil-large-v3
 
 # Whisper.cpp paths
 WHISPER_DIR := third_party/whisper.cpp
@@ -21,6 +23,10 @@ GGML_INCLUDE := $(WHISPER_DIR)/ggml/include
 SPEAKER_MODEL := models/wespeaker_en_voxceleb_CAM++.onnx
 SPEAKER_MODEL_URL := https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_CAM++.onnx
 
+# Silero VAD model (neural voice activity detection)
+SILERO_MODEL := models/silero_vad.onnx
+SILERO_MODEL_URL := https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx
+
 # CGO flags for whisper
 export CGO_ENABLED := 1
 export C_INCLUDE_PATH := $(PWD)/$(WHISPER_INCLUDE):$(PWD)/$(GGML_INCLUDE)
@@ -31,15 +37,15 @@ export MACOSX_DEPLOYMENT_TARGET := 15.0
 # Setup
 #══════════════════════════════════════════════════════════════
 
-setup: setup-deps whisper-lib setup-whisper setup-speaker
+setup: setup-deps whisper-lib setup-whisper setup-speaker setup-silero
 	@echo ""
 	@echo "╔════════════════════════════════════════╗"
 	@echo "║         Setup complete!                ║"
 	@echo "╚════════════════════════════════════════╝"
 	@echo ""
 	@echo "Next steps:"
-	@echo "  1. make enroll     - Enroll your voice"
-	@echo "  2. make speaker-id - Start live speaker ID"
+	@echo "  1. make enroll      - Enroll your voice"
+	@echo "  2. make vox         - Start voice assistant"
 
 setup-deps:
 	@echo "Installing system dependencies..."
@@ -60,6 +66,18 @@ setup-whisper:
 		echo "Model already exists: models/ggml-$(WHISPER_MODEL).bin"; \
 	fi
 
+# Download distil-large-v3 (6x faster, 756MB, ~1% WER increase)
+setup-whisper-fast:
+	@echo "Downloading fast Whisper model ($(WHISPER_MODEL_FAST))..."
+	@mkdir -p models
+	@if [ ! -f "models/ggml-$(WHISPER_MODEL_FAST).bin" ]; then \
+		curl -L -o "models/ggml-$(WHISPER_MODEL_FAST).bin" \
+			"https://huggingface.co/distil-whisper/distil-large-v3-ggml/resolve/main/ggml-distil-large-v3.bin"; \
+		echo "Model downloaded: models/ggml-$(WHISPER_MODEL_FAST).bin"; \
+	else \
+		echo "Model already exists: models/ggml-$(WHISPER_MODEL_FAST).bin"; \
+	fi
+
 setup-speaker:
 	@echo "Downloading speaker embedding model..."
 	@mkdir -p models
@@ -68,6 +86,16 @@ setup-speaker:
 		echo "Speaker model downloaded: $(SPEAKER_MODEL)"; \
 	else \
 		echo "Speaker model already exists: $(SPEAKER_MODEL)"; \
+	fi
+
+setup-silero:
+	@echo "Downloading Silero VAD model..."
+	@mkdir -p models
+	@if [ ! -f "$(SILERO_MODEL)" ]; then \
+		curl -L -o "$(SILERO_MODEL)" "$(SILERO_MODEL_URL)"; \
+		echo "Silero VAD model downloaded: $(SILERO_MODEL)"; \
+	else \
+		echo "Silero VAD model already exists: $(SILERO_MODEL)"; \
 	fi
 
 #══════════════════════════════════════════════════════════════
@@ -107,34 +135,43 @@ whisper-update:
 	$(MAKE) whisper-lib
 
 #══════════════════════════════════════════════════════════════
-# Speaker Enrollment & Identification (Primary Commands)
+# Speaker Enrollment
 #══════════════════════════════════════════════════════════════
 
-# Interactive voice enrollment - prompts for name, guides through recording
-enroll:
-	@echo ""
-	go run ./cmd/speaker-enroll
+speaker-enroll:
+	go run ./cmd/speaker enroll
 
-# Live speaker identification with transcription
-# Shows: "Speaker: transcript" for each utterance
-speaker-id: whisper-lib
-	go run ./cmd/speaker-id
+speaker-list:
+	go run ./cmd/speaker list
 
-# List enrolled profiles
-profiles:
-	@go run ./cmd/speaker-profile list
+speaker-delete:
+	@if [ -z "$(NAME)" ]; then \
+		echo "Usage: make speaker-delete NAME=<profile-name>"; \
+		exit 1; \
+	fi
+	go run ./cmd/speaker delete $(NAME)
+
+# Aliases for convenience
+enroll: speaker-enroll
+profiles: speaker-list
 
 #══════════════════════════════════════════════════════════════
 # Vox Voice Module
 #══════════════════════════════════════════════════════════════
 
 vox: whisper-lib
-	@echo "Starting Vox (streaming mode - 2s chunks)..."
 	go run ./cmd/vox -mode streaming
 
+# Fast mode: 6x faster using distil-large-v3 (requires: make setup-whisper-fast)
+vox-fast: whisper-lib
+	@if [ ! -f "models/ggml-$(WHISPER_MODEL_FAST).bin" ]; then \
+		echo "Error: Fast model not found. Run 'make setup-whisper-fast' first."; \
+		exit 1; \
+	fi
+	VOX_MODEL_PATH=models/ggml-$(WHISPER_MODEL_FAST).bin go run ./cmd/vox -mode streaming
+
 vox-accurate: whisper-lib
-	@echo "Starting Vox (accurate mode - 5s chunks)..."
-	go run ./cmd/vox -mode accurate
+	VOX_MODEL_PATH=models/ggml-$(WHISPER_MODEL).bin go run ./cmd/vox -mode accurate
 
 vox-debug: whisper-lib
 	go run ./cmd/vox -debug -mode streaming
@@ -147,9 +184,8 @@ build: whisper-lib
 	@echo "Building..."
 	@mkdir -p bin
 	go build -o bin/vox ./cmd/vox
-	go build -o bin/speaker-enroll ./cmd/speaker-enroll
-	go build -o bin/speaker-id ./cmd/speaker-id
-	@echo "Built: bin/vox, bin/speaker-enroll, bin/speaker-id"
+	go build -o bin/speaker ./cmd/speaker
+	@echo "Built: bin/vox, bin/speaker"
 
 #══════════════════════════════════════════════════════════════
 # Test
@@ -167,13 +203,6 @@ stt-test: whisper-lib
 
 stt-test-quick: whisper-lib
 	go run ./cmd/stt-test
-
-# Record test samples: make stt-record SCRIPT=1 TAKE=1
-SCRIPT ?= 1
-TAKE ?= 1
-stt-record: whisper-lib
-	@cat test/stt/scripts/script_$(SCRIPT).txt 2>/dev/null || echo "Script $(SCRIPT) not found"
-	go run ./cmd/stt-record -script $(SCRIPT) -take $(TAKE)
 
 #══════════════════════════════════════════════════════════════
 # Clean
@@ -198,22 +227,30 @@ help:
 	@echo "Atlas Makefile"
 	@echo ""
 	@echo "Getting Started:"
-	@echo "  make setup      - Install dependencies + download models"
-	@echo "  make enroll     - Enroll your voice (interactive)"
-	@echo "  make speaker-id - Live speaker identification"
+	@echo "  make setup              - Install dependencies + download models"
+	@echo "  make setup-whisper-fast - Download fast model (distil-large-v3, 6x faster)"
+	@echo "  make enroll             - Enroll your voice (interactive)"
 	@echo ""
 	@echo "Voice Module:"
-	@echo "  make vox        - Start Vox (wake word + commands)"
-	@echo "  make vox-debug  - Start with debug output"
+	@echo "  make vox          - Start Vox (streaming mode)"
+	@echo "  make vox-fast     - Start Vox with distil model (6x faster)"
+	@echo "  make vox-accurate - Start Vox (accurate mode, 5s chunks)"
+	@echo "  make vox-debug    - Start with debug output + energy bars"
 	@echo ""
-	@echo "Profiles:"
-	@echo "  make profiles   - List enrolled speaker profiles"
+	@echo "Models:"
+	@echo "  large-v3        - Best accuracy (3GB) - default"
+	@echo "  distil-large-v3 - 6x faster, ~1%% WER increase (756MB) - recommended"
+	@echo ""
+	@echo "Speaker Profiles:"
+	@echo "  make enroll               - Enroll your voice (interactive)"
+	@echo "  make profiles             - List enrolled speaker profiles"
+	@echo "  make speaker-delete NAME=x - Delete a profile"
 	@echo ""
 	@echo "Build & Test:"
-	@echo "  make build      - Build all binaries to ./bin/"
-	@echo "  make test       - Run all tests"
-	@echo "  make stt-test   - Test STT accuracy"
+	@echo "  make build    - Build all binaries to ./bin/"
+	@echo "  make test     - Run all tests"
+	@echo "  make stt-test - Test STT accuracy"
 	@echo ""
 	@echo "Clean:"
-	@echo "  make clean      - Remove binaries and models"
-	@echo "  make clean-all  - Remove everything including third_party/"
+	@echo "  make clean     - Remove binaries and models"
+	@echo "  make clean-all - Remove everything including third_party/"

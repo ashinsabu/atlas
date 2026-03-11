@@ -18,6 +18,11 @@ import (
 	ort "github.com/yalue/onnxruntime_go"
 )
 
+var (
+	onnxInitOnce sync.Once
+	onnxInitErr  error
+)
+
 func init() {
 	// Set ONNX Runtime shared library path based on platform
 	var libPath string
@@ -25,8 +30,8 @@ func init() {
 	case "darwin":
 		// macOS: check Homebrew paths
 		paths := []string{
-			"/opt/homebrew/lib/libonnxruntime.dylib",     // ARM64 Homebrew
-			"/usr/local/lib/libonnxruntime.dylib",        // Intel Homebrew
+			"/opt/homebrew/lib/libonnxruntime.dylib", // ARM64 Homebrew
+			"/usr/local/lib/libonnxruntime.dylib",    // Intel Homebrew
 		}
 		for _, p := range paths {
 			if _, err := os.Stat(p); err == nil {
@@ -41,6 +46,14 @@ func init() {
 	if libPath != "" {
 		ort.SetSharedLibraryPath(libPath)
 	}
+}
+
+// initONNX initializes the ONNX runtime exactly once.
+func initONNX() error {
+	onnxInitOnce.Do(func() {
+		onnxInitErr = ort.InitializeEnvironment()
+	})
+	return onnxInitErr
 }
 
 // ONNXExtractor uses an ONNX model for speaker embedding extraction.
@@ -61,8 +74,8 @@ func NewONNXExtractor(modelPath string) (*ONNXExtractor, error) {
 		return nil, fmt.Errorf("model not found: %s (run 'make setup-speaker')", modelPath)
 	}
 
-	// Initialize ONNX Runtime (idempotent)
-	if err := ort.InitializeEnvironment(); err != nil {
+	// Initialize ONNX Runtime (thread-safe, idempotent via sync.Once)
+	if err := initONNX(); err != nil {
 		return nil, fmt.Errorf("init onnx runtime: %w", err)
 	}
 
